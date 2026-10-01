@@ -1,0 +1,279 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Http\Requests\Admin\ApiIntegrationPayUpdateRequest;
+use App\Http\Requests\Admin\ApiIntegrationSmsUpdateRequest;
+use App\Http\Requests\Admin\ApiIntegrationCourierUpdateRequest;
+use App\Models\PaymentGateway;
+use App\Models\SmsGateway;
+use App\Models\SmsProviderJoypurhost;
+use App\Models\Courierapi;
+use App\Services\SteadfastCourierService;
+use App\Services\FraudCheckService;
+use Modules\Customer\Infrastructure\Adapters\Sms\JoypurHostSmsAdapter;
+use Toastr;
+use File;
+use Str;
+use Image;
+use DB;
+
+class ApiIntegrationController extends Controller
+{
+    public function __construct()
+    {
+        $this->middleware('permission:setting-list|setting-create|setting-edit|setting-delete', ['only' => ['pay_manage', 'sms_manage', 'courier_manage', 'test_steadfast_connection', 'test_fraud_connection', 'test_sms_connection', 'send_test_sms']]);
+        $this->middleware('permission:setting-edit', ['only' => ['pay_update', 'sms_update', 'courier_update']]);
+    }
+
+    public function pay_manage()
+    {
+        $bkash = PaymentGateway::firstOrCreate(
+            ['type' => 'bkash'],
+            ['status' => 0]
+        );
+        $shurjopay = PaymentGateway::firstOrCreate(
+            ['type' => 'shurjopay'],
+            ['status' => 0]
+        );
+
+        $total_gateways = PaymentGateway::count();
+        $active_gateways = PaymentGateway::where('status', 1)->count();
+
+        return view('backEnd.apiintegration.pay_manage', compact('bkash', 'shurjopay', 'total_gateways', 'active_gateways'));
+    }
+    
+    public function pay_update(ApiIntegrationPayUpdateRequest $request)
+    {
+      
+        $update_data = PaymentGateway::findOrFail($request->id);
+        $input = $request->validated();
+        $input['status'] = $request->has('status') && $request->status ? 1 : 0;
+        $update_data->update($input);
+        
+        Toastr::success('Success', 'Payment gateway updated successfully');
+        return redirect()->route('paymentgeteway.manage');
+    }
+    
+    public function sms_manage()
+    {
+        $joypurhost = SmsProviderJoypurhost::getOrCreate();
+        $custom = SmsGateway::custom();
+
+        $active_gateway = SmsGateway::getActive();
+        $active_provider = $active_gateway ? ($active_gateway->provider ?? SmsGateway::PROVIDER_JOYPURHOST) : SmsGateway::PROVIDER_JOYPURHOST;
+        $sms = ($active_provider === SmsGateway::PROVIDER_CUSTOM) ? $custom : $joypurhost;
+
+        $sms_balance = null;
+        if (!empty($joypurhost->api_key)) {
+            try {
+                $sms_balance = $joypurhost->getBalance();
+            } catch (\Throwable $e) {
+                // Silently ignore connection issues during page render
+            }
+        }
+
+        $providers = SmsGateway::getAvailableProviders();
+        return view('backEnd.apiintegration.sms_manage', compact('sms', 'joypurhost', 'custom', 'providers', 'sms_balance', 'active_provider'));
+    }
+
+    public function sms_update(ApiIntegrationSmsUpdateRequest $request)
+    {
+        $input = $request->validated();
+        $provider = $input['provider'] ?? SmsGateway::PROVIDER_JOYPURHOST;
+
+        if ($request->filled('id') && ($existing = SmsGateway::find($request->id))) {
+            $target = $existing;
+        } elseif ($provider === SmsGateway::PROVIDER_JOYPURHOST) {
+            $target = SmsProviderJoypurhost::getOrCreate();
+        } else {
+            $target = SmsGateway::custom();
+        }
+
+        $isStatusActive = $request->has('status') && $request->status ? 1 : 0;
+        $input['status'] = $isStatusActive;
+        $input['order'] = $request->has('order') && $request->order ? 1 : 0;
+        $input['forget_pass'] = $request->has('forget_pass') && $request->forget_pass ? 1 : 0;
+        $input['password_g'] = $request->has('password_g') && $request->password_g ? 1 : 0;
+
+        $senderColumn = SmsGateway::getSenderIdColumnName();
+        $senderIdValue = $input['sender_id'] ?? $input['serderid'] ?? null;
+        if ($senderColumn === 'sender_id') {
+            $input['sender_id'] = $senderIdValue;
+            unset($input['serderid']);
+        } else {
+            $input['serderid'] = $senderIdValue;
+            unset($input['sender_id']);
+        }
+
+        if (array_key_exists('admin_phone', $input)) {
+            $adminPhoneVal = $input['admin_phone'];
+            // Synchronize admin notification numbers across all gateways so provider switching keeps them
+            SmsGateway::query()->update(['admin_phone' => $adminPhoneVal]);
+        }
+
+        $target->update($input);
+
+        if ($isStatusActive) {
+            SmsGateway::where('id', '!=', $target->id)->update(['status' => 0]);
+        }
+
+        Toastr::success('Success', ($provider === 'joypurhost' ? 'JoypurHost SMS' : 'Custom SMS') . ' gateway updated successfully');
+        return redirect()->route('smsgeteway.manage');
+    }
+
+    public function test_sms_connection(Request $request)
+    {
+        $provider = $request->input('provider', SmsGateway::PROVIDER_JOYPURHOST);
+        $apiKey = $request->input('api_key');
+        $senderId = $request->input('sender_id');
+        $url = $request->input('url') ?: JoypurHostSmsAdapter::DEFAULT_URL;
+
+        if ($provider === SmsGateway::PROVIDER_JOYPURHOST) {
+            if (empty($apiKey)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'API Key is required to test JoypurHost SMS connection.',
+                ], 422);
+            }
+
+            $adapter = new JoypurHostSmsAdapter($apiKey, $senderId, $url);
+            $result = $adapter->testConnection();
+
+            return response()->json($result, $result['success'] ? 200 : 400);
+        }
+
+        if (empty($url)) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Gateway URL is required for Custom Provider.',
+            ], 422);
+        }
+
+        return response()->json([
+            'success' => true,
+            'current_balance' => null,
+            'message' => 'Custom Provider configuration verified.',
+        ]);
+    }
+
+    public function send_test_sms(Request $request)
+    {
+        $request->validate([
+            'phone' => 'required|string',
+            'message' => 'nullable|string|max:160',
+        ]);
+
+        $phone = $request->input('phone');
+        $testMessage = $request->input('message') ?: 'This is a test SMS from MondolShopBD.';
+        $provider = $request->input('provider', SmsGateway::PROVIDER_JOYPURHOST);
+        $apiKey = $request->input('api_key');
+        $senderId = $request->input('sender_id');
+        $url = $request->input('url') ?: JoypurHostSmsAdapter::DEFAULT_URL;
+
+        if ($provider === SmsGateway::PROVIDER_JOYPURHOST) {
+            if (empty($apiKey) || empty($senderId)) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'API Key and Sender ID are required to send test SMS.',
+                ], 422);
+            }
+
+            $adapter = new JoypurHostSmsAdapter($apiKey, $senderId, $url);
+            $sent = $adapter->send($phone, $testMessage);
+
+            if ($sent) {
+                return response()->json([
+                    'success' => true,
+                    'message' => "Test SMS sent successfully to {$phone}!",
+                ]);
+            }
+
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to send test SMS. Please check API credentials and phone number.',
+            ], 400);
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Sending test SMS is currently supported for JoypurHost SMS provider.',
+        ], 400);
+    }
+    
+    public function courier_manage(SteadfastCourierService $steadfastService)
+    {
+        $steadfast = Courierapi::firstOrCreate(
+            ['type' => 'steadfast'],
+            ['status' => 0]
+        );
+        $pathao = Courierapi::firstOrCreate(
+            ['type' => 'pathao'],
+            ['status' => 0]
+        );
+        $fraud = Courierapi::firstOrCreate(
+            ['type' => 'fraud'],
+            ['status' => 0]
+        );
+
+        $total_couriers = Courierapi::count();
+        $active_couriers = Courierapi::where('status', 1)->count();
+
+        $steadfast_balance = null;
+        if ($steadfast && (int) $steadfast->status === 1 && !empty($steadfast->api_key)) {
+            try {
+                $balanceData = $steadfastService->getCurrentBalance();
+                if (isset($balanceData['status']) && (int) $balanceData['status'] === 200) {
+                    $steadfast_balance = $balanceData['current_balance'] ?? null;
+                }
+            } catch (\Throwable $e) {
+                // Silently ignore connection errors on page render
+            }
+        }
+
+        return view('backEnd.apiintegration.courier_manage', compact(
+            'steadfast',
+            'pathao',
+            'fraud',
+            'total_couriers',
+            'active_couriers',
+            'steadfast_balance'
+        ));
+    }
+
+    public function test_steadfast_connection(Request $request, SteadfastCourierService $steadfastService)
+    {
+        $apiKey = $request->input('api_key');
+        $secretKey = $request->input('secret_key');
+        $baseUrl = $request->input('url');
+
+        $service = ($apiKey && $secretKey)
+            ? $steadfastService->withConfig($apiKey, $secretKey, $baseUrl)
+            : $steadfastService;
+
+        $result = $service->testConnection();
+
+        return response()->json($result);
+    }
+
+    public function test_fraud_connection(Request $request, FraudCheckService $fraudService)
+    {
+        $token = $request->input('token');
+        $url = $request->input('url');
+        $result = $fraudService->testConnection($token, $url);
+
+        return response()->json($result);
+    }
+
+    public function courier_update(ApiIntegrationCourierUpdateRequest $request)
+    {
+        $update_data = Courierapi::findOrFail($request->id);
+        $input = $request->validated();
+        $input['status'] = $request->has('status') && $request->status ? 1 : 0;
+        $update_data->update($input);
+
+        Toastr::success('Success', 'Courier API updated successfully');
+        return redirect()->route('courierapi.manage');
+    }
+}

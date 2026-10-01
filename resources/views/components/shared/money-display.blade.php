@@ -1,0 +1,1 @@
+<span class="font-medium text-gray-900">{{ $formatted() }}</span>

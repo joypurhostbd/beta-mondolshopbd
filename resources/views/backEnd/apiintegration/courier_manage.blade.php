@@ -1,0 +1,625 @@
+@extends('backEnd.layouts.master') 
+@section('title', 'Courier API Management')
+@section('css')
+<link href="{{asset('backEnd/assets/libs/switchery/switchery.min.css')}}" rel="stylesheet" type="text/css" />
+<style>
+  .courier-header-steadfast {
+    border-left: 4px solid #1abc9c;
+  }
+  .courier-header-pathao {
+    border-left: 4px solid #f1556c;
+  }
+  .courier-header-fraud {
+    border-left: 4px solid #f7b84b;
+  }
+</style>
+@endsection
+
+@section('content')
+<div class="container-fluid">
+  <!-- start page title -->
+  <div class="row">
+    <div class="col-12">
+      <div class="page-title-box">
+        <div class="page-title-right">
+          <ol class="breadcrumb m-0">
+            <li class="breadcrumb-item"><a href="{{ route('dashboard') }}">Dashboard</a></li>
+            <li class="breadcrumb-item"><a href="javascript: void(0);">Settings</a></li>
+            <li class="breadcrumb-item active">Courier API</li>
+          </ol>
+        </div>
+        <h4 class="page-title">Courier & Delivery API Configuration</h4>
+      </div>
+    </div>
+  </div>
+  <!-- end page title -->
+
+  <!-- KPI Summary Cards -->
+  <div class="row">
+    <div class="col-md-6 col-xl-3">
+      <div class="widget-rounded-circle card">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-6">
+              <div class="avatar-lg rounded-circle bg-soft-primary border-primary border">
+                <i class="fe-truck font-22 avatar-title text-primary"></i>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="text-end">
+                <h3 class="text-dark mt-1"><span data-plugin="counterup">{{ $total_couriers ?? 3 }}</span></h3>
+                <p class="text-muted mb-1 text-truncate">Total APIs</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-md-6 col-xl-3">
+      <div class="widget-rounded-circle card">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-6">
+              <div class="avatar-lg rounded-circle bg-soft-success border-success border">
+                <i class="fe-check-circle font-22 avatar-title text-success"></i>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="text-end">
+                <h4 class="mt-1">
+                  @if($steadfast && $steadfast->status == 1)
+                    <span class="badge bg-success">Active</span>
+                  @else
+                    <span class="badge bg-secondary">Inactive</span>
+                  @endif
+                </h4>
+                <p class="text-muted mb-1 text-truncate">Steadfast Status</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-md-6 col-xl-3">
+      <div class="widget-rounded-circle card">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-6">
+              <div class="avatar-lg rounded-circle bg-soft-danger border-danger border">
+                <i class="fe-send font-22 avatar-title text-danger"></i>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="text-end">
+                <h4 class="mt-1">
+                  @if($pathao && $pathao->status == 1)
+                    <span class="badge bg-success">Active</span>
+                  @else
+                    <span class="badge bg-secondary">Inactive</span>
+                  @endif
+                </h4>
+                <p class="text-muted mb-1 text-truncate">Pathao Status</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-md-6 col-xl-3">
+      <div class="widget-rounded-circle card">
+        <div class="card-body">
+          <div class="row">
+            <div class="col-6">
+              <div class="avatar-lg rounded-circle bg-soft-warning border-warning border">
+                <i class="fe-shield font-22 avatar-title text-warning"></i>
+              </div>
+            </div>
+            <div class="col-6">
+              <div class="text-end">
+                <h4 class="mt-1">
+                  @if($fraud && $fraud->status == 1)
+                    <span class="badge bg-success">Active</span>
+                  @else
+                    <span class="badge bg-secondary">Inactive</span>
+                  @endif
+                </h4>
+                <p class="text-muted mb-1 text-truncate">Fraud Check</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <!-- end KPI Summary Cards -->
+
+  <!-- Steadfast Courier Section -->
+  <div class="row">
+    <div class="col-12">
+      <div class="card courier-header-steadfast">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <div>
+            <h4 class="header-title mb-0 text-dark"><i class="fe-truck me-1 text-success"></i> Steadfast Courier API</h4>
+            <p class="text-muted font-13 mb-0">Configure Steadfast merchant credentials, base endpoint, and secret keys</p>
+          </div>
+          <div>
+            @if(isset($steadfast_balance) && $steadfast_balance !== null)
+              <span class="badge bg-soft-info text-info font-13 px-2 py-1 me-1" title="SteadFast Current Account Balance">
+                <i class="fe-credit-card me-1"></i>Balance: ৳{{ number_format((float)$steadfast_balance, 2) }}
+              </span>
+            @endif
+            @if($steadfast && $steadfast->status == 1)
+              <span class="badge bg-soft-success text-success px-2 py-1">Enabled</span>
+            @else
+              <span class="badge bg-soft-secondary text-secondary px-2 py-1">Disabled</span>
+            @endif
+          </div>
+        </div>
+        <div class="card-body">
+          <form action="{{ route('courierapi.update') }}" method="POST" data-parsley-validate="">
+            @csrf
+            <input type="hidden" name="id" value="{{ $steadfast->id }}">
+            <input type="hidden" name="type" value="steadfast">
+
+            <div class="row">
+              <div class="col-md-4">
+                <div class="form-group mb-3">
+                  <label for="steadfast_api_key" class="form-label">API Key <span class="text-danger">*</span></label>
+                  <input type="text" class="form-control @error('api_key') is-invalid @enderror" name="api_key" value="{{ old('api_key', $steadfast->api_key) }}" id="steadfast_api_key" required="" />
+                  @error('api_key')
+                  <span class="invalid-feedback" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-4">
+                <div class="form-group mb-3">
+                  <label for="steadfast_secret_key" class="form-label">Secret Key <span class="text-danger">*</span></label>
+                  <input type="password" class="form-control @error('secret_key') is-invalid @enderror" name="secret_key" value="{{ old('secret_key', $steadfast->secret_key) }}" id="steadfast_secret_key" required="" />
+                  @error('secret_key')
+                  <span class="invalid-feedback" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-4">
+                <div class="form-group mb-3">
+                  <label for="steadfast_url" class="form-label">API Base URL <span class="text-danger">*</span></label>
+                  <input type="url" class="form-control @error('url') is-invalid @enderror" name="url" value="{{ old('url', $steadfast->url) }}" id="steadfast_url" placeholder="https://portal.steadfast.com.bd/api/v1" required="" />
+                  @error('url')
+                  <span class="invalid-feedback" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="steadfast_token" class="form-label">Webhook Bearer Token (Optional)</label>
+                  <input type="text" class="form-control" name="token" value="{{ old('token', $steadfast->token) }}" id="steadfast_token" placeholder="Optional SteadFast webhook bearer/secret token" />
+                  <small class="text-muted font-12">Used to verify incoming automated parcel status webhooks from SteadFast.</small>
+                </div>
+              </div>
+
+              <div class="col-md-4">
+                <div class="form-group mb-3">
+                  <label class="form-label">SteadFast Webhook URL</label>
+                  <div class="input-group">
+                    <input type="text" readonly class="form-control bg-light font-12" id="steadfast_webhook_url" value="{{ url('api/webhook/steadfast') }}" />
+                    <button class="btn btn-outline-secondary btn-sm" type="button" onclick="navigator.clipboard.writeText(document.getElementById('steadfast_webhook_url').value); if(typeof toastr !== 'undefined') toastr.success('Webhook URL copied!');"><i class="fe-copy"></i></button>
+                  </div>
+                  <small class="text-muted font-12">Configure this URL in your SteadFast merchant portal for automatic delivery syncing.</small>
+                </div>
+              </div>
+
+              <div class="col-md-2">
+                <div class="form-group mb-3">
+                  <label for="steadfast_status" class="form-label d-block">Courier Status</label>
+                  <input type="checkbox" value="1" name="status" id="steadfast_status" data-plugin="switchery" data-color="#1abc9c" data-size="small" @if(old('status', $steadfast->status) == 1) checked @endif />
+                  <span class="ms-1 text-muted font-13 align-middle">{{ ($steadfast->status == 1) ? 'Active' : 'Inactive' }}</span>
+                  @error('status')
+                  <span class="invalid-feedback d-block" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-2 d-flex flex-wrap align-items-center gap-2">
+              <button type="submit" class="btn btn-success waves-effect waves-light"><i class="fe-save me-1"></i> Save Steadfast Settings</button>
+              <button type="button" id="btn-test-steadfast" class="btn btn-outline-info waves-effect waves-light">
+                <i class="fe-activity me-1"></i> Test Connection & Check Balance
+              </button>
+              <span id="steadfast-test-result" class="font-13"></span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Pathao Courier Section -->
+  <div class="row">
+    <div class="col-12">
+      <div class="card courier-header-pathao">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <div>
+            <h4 class="header-title mb-0 text-dark"><i class="fe-send me-1 text-danger"></i> Pathao Courier API</h4>
+            <p class="text-muted font-13 mb-0">Configure Pathao Courier base URL and OAuth bearer / access token</p>
+          </div>
+          <div>
+            @if($pathao && $pathao->status == 1)
+              <span class="badge bg-soft-success text-success px-2 py-1">Enabled</span>
+            @else
+              <span class="badge bg-soft-secondary text-secondary px-2 py-1">Disabled</span>
+            @endif
+          </div>
+        </div>
+        <div class="card-body">
+          <form action="{{ route('courierapi.update') }}" method="POST" data-parsley-validate="">
+            @csrf
+            <input type="hidden" name="id" value="{{ $pathao->id }}">
+            <input type="hidden" name="type" value="pathao">
+
+            <div class="row">
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_url" class="form-label">API Base URL <span class="text-danger">*</span></label>
+                  <input type="url" class="form-control @error('url') is-invalid @enderror" name="url" value="{{ old('url', $pathao->url ?: 'https://api-hermes.pathao.com') }}" id="pathao_url" placeholder="https://api-hermes.pathao.com" required>
+                  @error('url')
+                  <span class="invalid-feedback" role="alert"><strong>{{ $message }}</strong></span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_client_id" class="form-label">Client ID <span class="text-danger">*</span></label>
+                  <input type="text" class="form-control @error('client_id') is-invalid @enderror" name="client_id" value="{{ old('client_id', $pathao->client_id) }}" id="pathao_client_id" placeholder="Pathao Client ID">
+                  @error('client_id')
+                  <span class="invalid-feedback" role="alert"><strong>{{ $message }}</strong></span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_client_secret" class="form-label">Client Secret <span class="text-danger">*</span></label>
+                  <input type="password" class="form-control @error('client_secret') is-invalid @enderror" name="client_secret" value="{{ old('client_secret', $pathao->client_secret) }}" id="pathao_client_secret" placeholder="Pathao Client Secret">
+                  @error('client_secret')
+                  <span class="invalid-feedback" role="alert"><strong>{{ $message }}</strong></span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_username" class="form-label">Username <span class="text-danger">*</span></label>
+                  <input type="text" class="form-control @error('username') is-invalid @enderror" name="username" value="{{ old('username', $pathao->username) }}" id="pathao_username" placeholder="Pathao Username">
+                  @error('username')
+                  <span class="invalid-feedback" role="alert"><strong>{{ $message }}</strong></span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_password" class="form-label">Password <span class="text-danger">*</span></label>
+                  <input type="password" class="form-control @error('password') is-invalid @enderror" name="password" value="{{ old('password', $pathao->password) }}" id="pathao_password" placeholder="Pathao Password">
+                  @error('password')
+                  <span class="invalid-feedback" role="alert"><strong>{{ $message }}</strong></span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_grant_type" class="form-label">Grant Type</label>
+                  <input type="text" class="form-control" name="grant_type" value="{{ old('grant_type', $pathao->grant_type ?: 'password') }}" id="pathao_grant_type" readonly>
+                </div>
+              </div>
+
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="pathao_store_id" class="form-label">Store ID</label>
+                  <input type="number" class="form-control @error('store_id') is-invalid @enderror" name="store_id" value="{{ old('store_id', $pathao->store_id) }}" id="pathao_store_id" placeholder="Pathao Store ID">
+                  @error('store_id')
+                  <span class="invalid-feedback" role="alert"><strong>{{ $message }}</strong></span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-12">
+                <div class="form-group mb-3">
+                  <label for="pathao_token" class="form-label">Access Token</label>
+                  <input type="password" class="form-control" name="token" value="{{ old('token', $pathao->token) }}" id="pathao_token" placeholder="Access Token (automatically generated)">
+                  <small class="text-muted">Access token can be generated after saving the Pathao credentials.</small>
+                </div>
+              </div>
+
+              <div class="col-md-3">
+                <div class="form-group mb-3">
+                  <label for="pathao_status" class="form-label d-block">Courier Status</label>
+                  <input type="checkbox" value="1" name="status" id="pathao_status" data-plugin="switchery" data-color="#1abc9c" data-size="small" @if(old('status', $pathao->status) == 1) checked @endif />
+                  <span class="ms-1 text-muted font-13 align-middle">{{ ($pathao->status == 1) ? 'Active' : 'Inactive' }}</span>
+                  @error('status')
+                  <span class="invalid-feedback d-block" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-2 d-flex gap-2 flex-wrap">
+              <button type="submit" class="btn btn-danger waves-effect waves-light">
+                <i class="fe-save me-1"></i> Save Pathao Settings
+              </button>
+
+              <button type="button" id="testPathaoBtn" class="btn btn-outline-danger waves-effect waves-light">
+                <i class="fe-send me-1"></i> Generate / Test Token
+              </button>
+            </div>
+
+            <div id="pathaoTestResult" class="mt-3" style="display:none;"></div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+document.addEventListener('DOMContentLoaded', function () {
+    const btn = document.getElementById('testPathaoBtn');
+    const result = document.getElementById('pathaoTestResult');
+
+    if (!btn || !result) return;
+
+    btn.addEventListener('click', function () {
+        btn.disabled = true;
+        btn.innerHTML = '<i class="fe-loader me-1"></i> Testing...';
+
+        result.style.display = 'block';
+        result.className = 'mt-3 alert alert-info';
+        result.innerHTML = 'Connecting to Pathao API...';
+
+        fetch('{{ route("courierapi.pathao.test") }}', {
+            method: 'POST',
+            headers: {
+                'X-CSRF-TOKEN': '{{ csrf_token() }}',
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({})
+        })
+        .then(async response => {
+            const data = await response.json().catch(() => ({
+                success: false,
+                message: 'Invalid server response.'
+            }));
+
+            if (!response.ok || !data.success) {
+                throw new Error(data.message || 'Pathao connection failed.');
+            }
+
+            return data;
+        })
+        .then(data => {
+            result.className = 'mt-3 alert alert-success';
+
+            let message = data.message || 'Pathao connection successful.';
+
+            if (data.expires_at) {
+                message += '<br><strong>Token Expires:</strong> ' + data.expires_at;
+            }
+
+            result.innerHTML = '<i class="fe-check-circle me-1"></i>' + message;
+        })
+        .catch(error => {
+            result.className = 'mt-3 alert alert-danger';
+            result.innerHTML =
+                '<i class="fe-alert-circle me-1"></i>' +
+                (error.message || 'Pathao connection failed.');
+        })
+        .finally(() => {
+            btn.disabled = false;
+            btn.innerHTML = '<i class="fe-send me-1"></i> Generate / Test Token';
+        });
+    });
+});
+</script>
+
+<!-- Fraud Check API Section -->
+  <div class="row">
+    <div class="col-12">
+      <div class="card courier-header-fraud">
+        <div class="card-header bg-white d-flex justify-content-between align-items-center">
+          <div>
+            <h4 class="header-title mb-0 text-dark"><i class="fe-shield me-1 text-warning"></i> Fraud Check API (Courier Delivery History)</h4>
+            <p class="text-muted font-13 mb-0">Configure cross-courier customer success rate / fraud risk verification API token</p>
+          </div>
+          <div>
+            @if($fraud && $fraud->status == 1)
+              <span class="badge bg-soft-success text-success px-2 py-1">Enabled</span>
+            @else
+              <span class="badge bg-soft-secondary text-secondary px-2 py-1">Disabled</span>
+            @endif
+          </div>
+        </div>
+        <div class="card-body">
+          <form action="{{ route('courierapi.update') }}" method="POST" data-parsley-validate="">
+            @csrf
+            <input type="hidden" name="id" value="{{ $fraud->id }}">
+            <input type="hidden" name="type" value="fraud">
+
+            <div class="row">
+              <div class="col-md-6">
+                <div class="form-group mb-3">
+                  <label for="fraud_token" class="form-label">API Secret Token <span class="text-danger">*</span></label>
+                  <input type="password" class="form-control @error('token') is-invalid @enderror" name="token" value="{{ old('token', $fraud->token) }}" id="fraud_token" placeholder="Fraud Check API Token" required="" />
+                  @error('token')
+                  <span class="invalid-feedback" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-4">
+                <div class="form-group mb-3">
+                  <label for="fraud_url" class="form-label">API Base URL</label>
+                  <input type="url" class="form-control @error('url') is-invalid @enderror" name="url" value="{{ old('url', $fraud->url ?: 'https://dash.hoorin.com/api/courier/api') }}" id="fraud_url" placeholder="https://dash.hoorin.com/api/courier/api" />
+                  <small class="text-muted font-12">Default: https://dash.hoorin.com/api/courier/api</small>
+                  @error('url')
+                  <span class="invalid-feedback" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+
+              <div class="col-md-2">
+                <div class="form-group mb-3">
+                  <label for="fraud_status" class="form-label d-block">Fraud Check Status</label>
+                  <input type="checkbox" value="1" name="status" id="fraud_status" data-plugin="switchery" data-color="#1abc9c" data-size="small" @if(old('status', $fraud->status) == 1) checked @endif />
+                  <span class="ms-1 text-muted font-13 align-middle">{{ ($fraud->status == 1) ? 'Active' : 'Inactive' }}</span>
+                  @error('status')
+                  <span class="invalid-feedback d-block" role="alert">
+                    <strong>{{ $message }}</strong>
+                  </span>
+                  @enderror
+                </div>
+              </div>
+            </div>
+
+            <div class="mt-2 d-flex flex-wrap align-items-center gap-2">
+              <button type="submit" class="btn btn-warning waves-effect waves-light"><i class="fe-save me-1"></i> Save Fraud Check Settings</button>
+              <button type="button" id="btn-test-fraud" class="btn btn-outline-warning waves-effect waves-light">
+                <i class="fe-shield me-1"></i> Test Connection
+              </button>
+              <span id="fraud-test-result" class="font-13"></span>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+@endsection
+
+@section('script')
+<script src="{{asset('backEnd/assets/libs/parsleyjs/parsley.min.js')}}"></script>
+<script src="{{asset('backEnd/assets/js/pages/form-validation.init.js')}}"></script>
+<script src="{{asset('backEnd/assets/libs/switchery/switchery.min.js')}}"></script>
+<script>
+  $(document).ready(function () {
+    if (typeof Switchery !== 'undefined') {
+      $('[data-plugin="switchery"]').each(function (idx, obj) {
+        new Switchery($(this)[0], $(this).data());
+      });
+    }
+
+    $(document).on('click', '#btn-test-steadfast', function(e) {
+      e.preventDefault();
+      var $btn = $(this);
+      var $result = $('#steadfast-test-result');
+      var apiKey = $('#steadfast_api_key').val();
+      var secretKey = $('#steadfast_secret_key').val();
+      var url = $('#steadfast_url').val();
+
+      if (!apiKey || !secretKey) {
+        if (typeof toastr !== 'undefined') toastr.warning('Please enter both API Key and Secret Key to test connection.');
+        $result.html('<span class="text-danger font-12"><i class="fe-alert-triangle me-1"></i>Please enter API Key and Secret Key</span>');
+        return;
+      }
+
+      $btn.prop('disabled', true).html('<i class="fa fa-spinner fa-spin me-1"></i> Testing...');
+      $result.html('<span class="text-muted font-12"><i class="fa fa-spinner fa-spin me-1"></i>Connecting to SteadFast...</span>');
+
+      $.ajax({
+        type: 'POST',
+        url: "{{ route('courierapi.steadfast.test') }}",
+        data: {
+          _token: "{{ csrf_token() }}",
+          api_key: apiKey,
+          secret_key: secretKey,
+          url: url
+        },
+        success: function(res) {
+          $btn.prop('disabled', false).html('<i class="fe-activity me-1"></i> Test Connection & Check Balance');
+          if (res && res.success) {
+            var bal = (res.current_balance !== null && typeof res.current_balance !== 'undefined') ? ' (Balance: ৳' + parseFloat(res.current_balance).toLocaleString('en-US', {minimumFractionDigits: 2}) + ')' : '';
+            $result.html('<span class="badge bg-soft-success text-success p-1"><i class="fe-check-circle me-1"></i>' + (res.message || 'Connected successfully!') + bal + '</span>');
+            if (typeof toastr !== 'undefined') toastr.success(res.message + bal);
+          } else {
+            var errMsg = (res && res.message) ? res.message : 'Connection failed';
+            $result.html('<span class="badge bg-soft-danger text-danger p-1"><i class="fe-x-circle me-1"></i>' + errMsg + '</span>');
+            if (typeof toastr !== 'undefined') toastr.error(errMsg);
+          }
+        },
+        error: function(xhr) {
+          $btn.prop('disabled', false).html('<i class="fe-activity me-1"></i> Test Connection & Check Balance');
+          var msg = (xhr.responseJSON && xhr.responseJSON.message) ? xhr.responseJSON.message : 'Request failed';
+          $result.html('<span class="badge bg-soft-danger text-danger p-1"><i class="fe-x-circle me-1"></i>' + msg + '</span>');
+          if (typeof toastr !== 'undefined') toastr.error(msg);
+        }
+      });
+    });
+
+    $(document).on('click', '#btn-test-fraud', function(e) {
+      e.preventDefault();
+      var $btn = $(this);
+      var $result = $('#fraud-test-result');
+      var token = $('#fraud_token').val();
+      var url = $('#fraud_url').val();
+
+      if (!token) {
+        if (typeof toastr !== 'undefined') toastr.warning('Please enter an API Token to test connection.');
+        $result.html('<span class="text-danger font-12"><i class="fe-alert-triangle me-1"></i>Please enter API Token</span>');
+        return;
+      }
+
+      $btn.prop('disabled', true).html('<i class="fa fa-spinner fa-spin me-1"></i> Testing...');
+      $result.html('<span class="text-muted font-12"><i class="fa fa-spinner fa-spin me-1"></i>Connecting to Hoorin API...</span>');
+
+      $.ajax({
+        type: 'POST',
+        url: "{{ route('courierapi.fraud.test') }}",
+        data: {
+          _token: "{{ csrf_token() }}",
+          token: token,
+          url: url
+        },
+        success: function(res) {
+          $btn.prop('disabled', false).html('<i class="fe-shield me-1"></i> Test Connection');
+          if (res && (res.status === 'success' || res.success)) {
+            var msg = res.message || 'Connected successfully!';
+            $result.html('<span class="badge bg-soft-success text-success p-1"><i class="fe-check-circle me-1"></i>' + msg + '</span>');
+            if (typeof toastr !== 'undefined') toastr.success(msg);
+          } else {
+            var errMsg = (res && res.message) ? res.message : 'Connection failed';
+            $result.html('<span class="badge bg-soft-danger text-danger p-1"><i class="fe-x-circle me-1"></i>' + errMsg + '</span>');
+            if (typeof toastr !== 'undefined') toastr.error(errMsg);
+          }
+        },
+        error: function(xhr) {
+          $btn.prop('disabled', false).html('<i class="fe-shield me-1"></i> Test Connection');
+          var msg = (xhr.responseJSON && xhr.responseJSON.message) ? xhr.responseJSON.message : 'Request failed';
+          $result.html('<span class="badge bg-soft-danger text-danger p-1"><i class="fe-x-circle me-1"></i>' + msg + '</span>');
+          if (typeof toastr !== 'undefined') toastr.error(msg);
+        }
+      });
+    });
+  });
+</script>
+@endsection

@@ -1,0 +1,397 @@
+<?php
+
+namespace App\Models;
+
+use App\Services\FraudCheckService;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Order extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'invoice_id',
+        'amount',
+        'discount',
+        'shipping_charge',
+        'customer_id',
+        'order_status',
+        'ip_address',
+        'note',
+        'f_check',
+        'fraud_report',
+        'user_id',
+        'admin_note',
+        'consignment_id',
+        'tracking_code',
+        'courier_name',
+        'courier_status',
+        'payment_status',
+    ];
+
+    protected $casts = [
+        'amount' => 'decimal:2',
+        'discount' => 'decimal:2',
+        'shipping_charge' => 'decimal:2',
+        'order_status' => 'integer',
+        'customer_id' => 'integer',
+        'fraud_report' => 'array',
+    ];
+
+    public static function booted()
+    {
+        static::creating(function ($model) {
+            $model->invoice_id = $model->invoice_id.rand(1111, 9999);
+        });
+    }
+
+    public function orderdetails()
+    {
+        return $this->hasMany(OrderDetails::class, 'order_id');
+    }
+
+    public function status()
+    {
+        return $this->belongsTo(OrderStatus::class, 'order_status');
+    }
+
+    public function shipping()
+    {
+        return $this->hasOne(Shipping::class, 'order_id');
+    }
+
+    public function payment()
+    {
+        return $this->hasOne(Payment::class, 'order_id');
+    }
+
+    public function customer()
+    {
+        return $this->belongsTo(Customer::class, 'customer_id');
+    }
+
+    public function user()
+    {
+        return $this->belongsTo(User::class, 'user_id');
+    }
+
+    /**
+     * Delegate fraud check to FraudCheckService
+     *
+     * @deprecated Use FraudCheckService directly
+     */
+    public function fraud_check($phone = null)
+    {
+        $phone = $phone ?: ($this->shipping->phone ?? null);
+
+        return app(FraudCheckService::class)->check($phone ?? '');
+    }
+
+    /**
+     * Get structured Order Guard / Courier fraud check stats.
+     */
+    public function getFraudReportStatsAttribute(): array
+    {
+        if (is_array($this->fraud_report) && ! empty($this->fraud_report)) {
+            $total = (int) ($this->fraud_report['total_parcel'] ?? $this->fraud_report['total_orders'] ?? 0);
+            $delivered = (int) ($this->fraud_report['total_delivered'] ?? 0);
+            $canceled = (int) ($this->fraud_report['total_cancel'] ?? 0);
+            $rate = isset($this->fraud_report['delivery_rate'])
+                ? (float) $this->fraud_report['delivery_rate']
+                : ($total > 0 ? round(($delivered / $total) * 100, 2) : (float) ($this->f_check ?? 0));
+
+            return [
+                'total_parcel' => $total,
+                'total_delivered' => $delivered,
+                'total_cancel' => $canceled,
+                'delivery_rate' => $rate,
+                'has_data' => true,
+                'courier_breakdown' => $this->fraud_report['courier_breakdown'] ?? $this->fraud_report['summaries'] ?? [],
+            ];
+        }
+
+        // Fallback: Check if phone is cached in Redis/Cache
+        $phone = $this->shipping?->phone ?? $this->customer?->phone ?? null;
+        if (! empty($phone)) {
+            $cleanPhone = preg_replace('/[^0-9]/', '', $phone);
+            $cached = \Illuminate\Support\Facades\Cache::get("fraud_check_{$cleanPhone}");
+            if (is_array($cached) && isset($cached['total_stats'])) {
+                $stats = $cached['total_stats'];
+
+                return [
+                    'total_parcel' => (int) ($stats['total_parcel'] ?? 0),
+                    'total_delivered' => (int) ($stats['total_delivered'] ?? 0),
+                    'total_cancel' => (int) ($stats['total_cancel'] ?? 0),
+                    'delivery_rate' => (float) ($stats['delivery_rate'] ?? ($this->f_check ?? 0)),
+                    'has_data' => true,
+                    'courier_breakdown' => $cached['courier_breakdown'] ?? [],
+                ];
+            }
+        }
+
+        $rate = (float) ($this->f_check ?? 0);
+
+        return [
+            'total_parcel' => 0,
+            'total_delivered' => 0,
+            'total_cancel' => 0,
+            'delivery_rate' => $rate,
+            'has_data' => $rate > 0,
+            'courier_breakdown' => [],
+        ];
+    }
+
+    /**
+     * Get the standardized display name for the assigned courier.
+     */
+    public function getCourierDisplayNameAttribute(): string
+    {
+        $name = $this->courier_name ?: 'SteadFast';
+
+        return strcasecmp($name, 'steadfast') === 0 ? 'SteadFast' : ucfirst($name);
+    }
+
+    /**
+     * Get primary courier tracking identifier (prefers numeric Consignment/Tracking ID over raw code).
+     */
+    public function getCourierTrackingIdAttribute(): ?string
+    {
+        return $this->consignment_id ?: $this->tracking_code;
+    }
+
+    /**
+     * Get direct tracking URL for the courier consignment.
+     */
+    public function getCourierTrackingUrlAttribute(): ?string
+    {
+        $id = $this->consignment_id ?: $this->tracking_code;
+        if (empty($id)) {
+            return null;
+        }
+
+        if (strtolower($this->courier_name ?? '') === 'pathao' || str_starts_with(strtoupper($id), 'PTH')) {
+            return 'https://pathao.com/courier-tracking/?consignment_id='.urlencode($id);
+        }
+
+        return 'https://steadfast.com.bd/t/'.urlencode($id);
+    }
+
+    /**
+     * Check whether the order has been dispatched to a courier partner.
+     */
+    public function isCourierDispatched(): bool
+    {
+        return ! empty($this->consignment_id) || ! empty($this->tracking_code);
+    }
+
+    /**
+     * Check whether the order's status is locked by an active courier parcel.
+     * Locked while actively in courier, but unlocked if cancelled by courier.
+     */
+    public function isCourierLocked(): bool
+    {
+        if (! $this->isCourierDispatched()) {
+            return false;
+        }
+
+        $courierStatus = strtolower((string) ($this->courier_status ?? ''));
+
+        return ! in_array($courierStatus, ['cancelled', 'canceled', 'cancel'], true);
+    }
+
+    public const COURIER_FILTER_PENDING = 'courier-pending';
+
+    public const COURIER_FILTER_IN_REVIEW = 'courier-in-review';
+
+    public const COURIER_FILTER_IN_TRANSIT = 'courier-in-transit';
+
+    public const COURIER_FILTER_SHIPPED = 'courier-shipped';
+
+    public const COURIER_FILTER_PICKED = 'courier-picked';
+
+    public const COURIER_FILTER_HOLD = 'courier-hold';
+
+    public const COURIER_FILTER_PARTIAL = 'courier-partial';
+
+    public const COURIER_FILTER_CANCEL = 'courier-cancel';
+
+    public const COURIER_FILTER_RETURNED = 'courier-returned';
+
+    public const COURIER_FILTER_CANCELLED_APPROVAL_PENDING = 'courier-cancelled-approval-pending';
+
+    public const COURIER_FILTER_DELIVERED = 'courier-delivered';
+
+    /**
+     * Get all supported courier filter definitions.
+     *
+     * @return array<string, array{name: string, statuses: array<string>}>
+     */
+    public static function getCourierFilterDefinitions(): array
+    {
+        return [
+            self::COURIER_FILTER_PENDING => [
+                'name' => 'Courier Pending',
+                'statuses' => ['pending'],
+            ],
+            self::COURIER_FILTER_IN_REVIEW => [
+                'name' => 'Courier In Review',
+                'statuses' => ['in_review', 'in-review'],
+            ],
+            self::COURIER_FILTER_IN_TRANSIT => [
+                'name' => 'Courier In Transit',
+                'statuses' => ['in_transit', 'in-transit'],
+            ],
+            self::COURIER_FILTER_SHIPPED => [
+                'name' => 'Courier Shipped',
+                'statuses' => ['shipped'],
+            ],
+            self::COURIER_FILTER_PICKED => [
+                'name' => 'Courier Picked',
+                'statuses' => ['picked'],
+            ],
+            self::COURIER_FILTER_HOLD => [
+                'name' => 'Courier Hold',
+                'statuses' => ['hold', 'on-hold'],
+            ],
+            self::COURIER_FILTER_PARTIAL => [
+                'name' => 'Courier Partial',
+                'statuses' => ['partial_delivered', 'partial'],
+            ],
+            self::COURIER_FILTER_CANCEL => [
+                'name' => 'Courier Cancel',
+                'statuses' => ['cancelled', 'canceled'],
+            ],
+            self::COURIER_FILTER_RETURNED => [
+                'name' => 'Courier Returned',
+                'statuses' => ['returned', 'return'],
+            ],
+            self::COURIER_FILTER_CANCELLED_APPROVAL_PENDING => [
+                'name' => 'Courier Cancelled Approval Pending',
+                'statuses' => ['cancelled_approval_pending'],
+            ],
+            self::COURIER_FILTER_DELIVERED => [
+                'name' => 'Courier Delivered',
+                'statuses' => ['delivered', 'completed', 'successful'],
+            ],
+        ];
+    }
+
+    /**
+     * Get list of courier filter slugs.
+     *
+     * @return array<string>
+     */
+    public static function getCourierFilterSlugs(): array
+    {
+        return array_keys(self::getCourierFilterDefinitions());
+    }
+
+    /**
+     * Check if a given slug is a recognized courier filter slug.
+     */
+    public static function isCourierFilterSlug(?string $slug): bool
+    {
+        if (empty($slug)) {
+            return false;
+        }
+
+        return array_key_exists(strtolower(trim($slug)), self::getCourierFilterDefinitions());
+    }
+
+    /**
+     * Get the human-friendly display name for a courier filter slug.
+     */
+    public static function getCourierFilterName(?string $slug): ?string
+    {
+        if (empty($slug)) {
+            return null;
+        }
+        $definitions = self::getCourierFilterDefinitions();
+        $normalized = strtolower(trim($slug));
+
+        return $definitions[$normalized]['name'] ?? null;
+    }
+
+    /**
+     * Get aggregate counts for all courier filter statuses with a single query (Zero N+1).
+     *
+     * @return array<string, int>
+     */
+    public static function getCourierCounts(): array
+    {
+        $definitions = self::getCourierFilterDefinitions();
+        $counts = array_fill_keys(array_keys($definitions), 0);
+
+        $rawStatusCounts = self::query()
+            ->where(function (Builder $q) {
+                $q->whereNotNull('consignment_id')->where('consignment_id', '!=', '')
+                    ->orWhereNotNull('tracking_code')->where('tracking_code', '!=', '');
+            })
+            ->selectRaw("LOWER(TRIM(COALESCE(courier_status, 'pending'))) as stat, COUNT(*) as aggregate")
+            ->groupBy('stat')
+            ->pluck('aggregate', 'stat')
+            ->toArray();
+
+        foreach ($definitions as $slug => $def) {
+            $total = 0;
+            foreach ($def['statuses'] as $st) {
+                $total += $rawStatusCounts[$st] ?? 0;
+            }
+            if ($slug === self::COURIER_FILTER_PENDING) {
+                $total += $rawStatusCounts[''] ?? 0;
+            }
+            $counts[$slug] = $total;
+        }
+
+        return $counts;
+    }
+
+    /**
+     * Scope query to filter orders by status slug (supports 'all', standard OrderStatus slugs, and courier filters).
+     */
+    public function scopeFilterByStatusSlug(Builder $query, ?string $slug): Builder
+    {
+        $normalized = strtolower(trim((string) $slug));
+
+        if (empty($normalized) || $normalized === 'all') {
+            return $query;
+        }
+
+        if (self::isCourierFilterSlug($normalized)) {
+            $fallbackStatusId = OrderStatus::where('slug', $normalized)->value('id');
+            $definitions = self::getCourierFilterDefinitions();
+            $targetStatuses = $definitions[$normalized]['statuses'] ?? [];
+
+            return $query->where(function (Builder $q) use ($normalized, $targetStatuses, $fallbackStatusId) {
+                $q->whereIn('courier_status', $targetStatuses);
+
+                if ($normalized === self::COURIER_FILTER_PENDING) {
+                    $q->orWhere(function (Builder $sub) {
+                        $sub->where(function (Builder $dispatched) {
+                            $dispatched->whereNotNull('consignment_id')->where('consignment_id', '!=', '')
+                                ->orWhereNotNull('tracking_code')->where('tracking_code', '!=', '');
+                        })->where(function (Builder $nested) {
+                            $nested->whereNull('courier_status')
+                                ->orWhere('courier_status', '')
+                                ->orWhere('courier_status', 'pending');
+                        });
+                    });
+                }
+
+                if ($fallbackStatusId) {
+                    $q->orWhere('order_status', $fallbackStatusId);
+                }
+            });
+        }
+
+        // Standard OrderStatus lookup
+        $status = OrderStatus::where('slug', $normalized)->first();
+        if ($status) {
+            return $query->where('order_status', $status->id);
+        }
+
+        return $query->whereRaw('1=0');
+    }
+}

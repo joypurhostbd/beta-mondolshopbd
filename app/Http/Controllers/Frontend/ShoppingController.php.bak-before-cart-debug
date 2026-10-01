@@ -1,0 +1,351 @@
+<?php
+
+namespace App\Http\Controllers\Frontend;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Frontend\CartStoreRequest;
+use App\Jobs\SendMetaCapiEventJob;
+use App\Models\GeneralSetting;
+use App\Models\IncompleteOrder;
+use App\Models\PaymentGateway;
+use App\Models\Product;
+use App\Models\ShippingCharge;
+use App\ValueObjects\Phone;
+use DB;
+use Gloudemans\Shoppingcart\Facades\Cart;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Session;
+use Illuminate\Support\Str;
+use Toastr;
+
+class ShoppingController extends Controller
+{
+    protected function dispatchMetaAddToCartEvent(int|string $productId, string $name, float $price, int $qty): string
+    {
+        $eventId = 'cart_'.$productId.'_'.time().'_'.Str::random(6);
+
+        try {
+            $fbp = request()->cookie('_fbp');
+            $fbc = request()->cookie('_fbc') ?: (request()->has('fbclid') ? 'fb.1.'.time().'.'.request()->get('fbclid') : null);
+            $userData = [
+                'fbp' => $fbp,
+                'fbc' => $fbc,
+                'client_ip_address' => request()->ip(),
+                'client_user_agent' => request()->userAgent(),
+            ];
+
+            $customData = [
+                'currency' => 'BDT',
+                'value' => (float) ($price * $qty),
+                'content_type' => 'product',
+                'content_name' => $name,
+                'content_ids' => [(string) $productId],
+                'contents' => [
+                    [
+                        'id' => (string) $productId,
+                        'quantity' => (int) $qty,
+                        'item_price' => (float) $price,
+                    ],
+                ],
+                'num_items' => (int) $qty,
+            ];
+
+            SendMetaCapiEventJob::dispatch(
+                'AddToCart',
+                $userData,
+                $customData,
+                $eventId,
+                request()->fullUrl()
+            );
+        } catch (\Throwable $e) {
+            Log::warning('Meta CAPI AddToCart dispatch error: '.$e->getMessage());
+        }
+
+        return $eventId;
+    }
+
+    public function addTocartGet($id, Request $request)
+    {
+        $qty = 1;
+        $productInfo = DB::table('products')->where('id', $id)->first();
+        $productImage = DB::table('productimages')->where('product_id', $id)->orderBy('is_featured', 'desc')->first();
+        $cartinfo = Cart::instance('shopping')->add([
+            'id' => $productInfo->id,
+            'name' => $productInfo->name,
+            'qty' => $qty,
+            'price' => $productInfo->new_price,
+            'options' => [
+                'image' => $productImage->image ?? 'frontEnd/images/no-image.png',
+                'old_price' => $productInfo->old_price,
+                'slug' => $productInfo->slug,
+                'purchase_price' => $productInfo->purchase_price,
+                'product_size' => $request->size,
+                'product_color' => $request->color,
+                'pro_unit' => $request->pro_unit,
+            ],
+        ]);
+
+        $eventId = $this->dispatchMetaAddToCartEvent(
+            $productInfo->id,
+            $productInfo->name,
+            (float) $productInfo->new_price,
+            $qty
+        );
+
+        $cartCount = Cart::instance('shopping')->count();
+        $subtotal = Cart::instance('shopping')->subtotal();
+        $subtotal = str_replace(',', '', $subtotal);
+        $subtotal = str_replace('.00', '', $subtotal);
+        $items = Cart::instance('shopping')->content();
+        $sideCartHtml = view('frontEnd.layouts.partials.side_cart_items', compact('items', 'subtotal'))->render();
+
+        return response()->json([
+            'status' => 'success',
+            'cartinfo' => $cartinfo,
+            'cart_count' => $cartCount,
+            'subtotal' => $subtotal,
+            'side_cart_html' => $sideCartHtml,
+            'event_id' => $eventId,
+            'item' => [
+                'id' => (string) $productInfo->id,
+                'name' => $productInfo->name,
+                'price' => (float) $productInfo->new_price,
+                'qty' => $qty,
+                'value' => (float) ($productInfo->new_price * $qty),
+            ],
+        ]);
+    }
+
+    public function IncompleteOrder(Request $request)
+    {
+        $cartId = Session::get('incomplete-order');
+        if (! $cartId) {
+            $cartId = session()->getId();
+            Session::put('incomplete-order', $cartId);
+        }
+
+        $cartinfo = Cart::instance('shopping')->content();
+        if ($cartinfo && $cartinfo->isNotEmpty()) {
+            $data = IncompleteOrder::where('cart_id', $cartId)->first() ?? new IncompleteOrder;
+            $data->cart_id = $cartId;
+            $data->name = $request->filled('name') ? trim($request->name) : $data->name;
+            $data->phone = $request->filled('phone') ? Phone::normalize($request->phone) : $data->phone;
+            $data->address = $request->filled('address') ? trim($request->address) : $data->address;
+            $data->data = json_encode($cartinfo);
+            $data->save();
+
+            return response()->json(['status' => 'success']);
+        }
+
+        return response()->json(['status' => 'empty_cart'], 200);
+    }
+
+    public function cart_store(CartStoreRequest $request)
+    {
+        $product = Product::where(['id' => $request->id])->first();
+        $imagePath = ($product->featuredImage ?? $product->image)?->image ?? 'frontEnd/images/no-image.png';
+        Cart::instance('shopping')->add([
+            'id' => $product->id,
+            'name' => $product->name,
+            'qty' => (int) $request->qty,
+            'price' => $product->new_price,
+            'options' => [
+                'slug' => $product->slug,
+                'image' => $imagePath,
+                'old_price' => $product->new_price,
+                'purchase_price' => $product->purchase_price,
+                'product_size' => $request->product_size,
+                'product_color' => $request->product_color,
+                'pro_unit' => $request->pro_unit,
+            ],
+        ]);
+
+        $qty = (int) ($request->qty ?: 1);
+        $price = (float) $product->new_price;
+        $eventId = $this->dispatchMetaAddToCartEvent(
+            $product->id,
+            $product->name,
+            $price,
+            $qty
+        );
+
+        if ($request->ajax() || $request->wantsJson()) {
+            $cartCount = Cart::instance('shopping')->count();
+            $subtotal = Cart::instance('shopping')->subtotal();
+            $subtotal = str_replace(',', '', $subtotal);
+            $subtotal = str_replace('.00', '', $subtotal);
+            $items = Cart::instance('shopping')->content();
+            $sideCartHtml = view('frontEnd.layouts.partials.side_cart_items', compact('items', 'subtotal'))->render();
+
+            return response()->json([
+                'status' => 'success',
+                'message' => 'Product successfully added to cart',
+                'cart_count' => $cartCount,
+                'subtotal' => $subtotal,
+                'side_cart_html' => $sideCartHtml,
+                'event_id' => $eventId,
+                'item' => [
+                    'id' => (string) $product->id,
+                    'name' => $product->name,
+                    'price' => $price,
+                    'qty' => $qty,
+                    'value' => (float) ($price * $qty),
+                ],
+            ]);
+        }
+
+        Session::flash('fb_add_to_cart', [
+            'event_id' => $eventId,
+            'id' => (string) $product->id,
+            'name' => $product->name,
+            'price' => $price,
+            'qty' => $qty,
+            'value' => (float) ($price * $qty),
+        ]);
+
+        Toastr::success('Product successfully add to cart', 'Success!');
+        $activeCartBtnText = GeneralSetting::where('status', 1)->value('cart_btn_text');
+        $isAddToCart = $request->order_now === 'কার্টে যোগ করুন'
+            || $request->order_now === 'কার্টে যোগ'
+            || ($activeCartBtnText && $request->order_now === $activeCartBtnText);
+
+        if ($isAddToCart) {
+            return redirect()->back();
+        } else {
+            return redirect()->route('customer.checkout');
+        }
+    }
+
+    public function side_cart_content(Request $request)
+    {
+        $cartCount = Cart::instance('shopping')->count();
+        $subtotal = Cart::instance('shopping')->subtotal();
+        $subtotal = str_replace(',', '', $subtotal);
+        $subtotal = str_replace('.00', '', $subtotal);
+        $items = Cart::instance('shopping')->content();
+        $sideCartHtml = view('frontEnd.layouts.partials.side_cart_items', compact('items', 'subtotal'))->render();
+
+        if ($request->ajax() || $request->wantsJson()) {
+            return response()->json([
+                'status' => 'success',
+                'cart_count' => $cartCount,
+                'subtotal' => $subtotal,
+                'side_cart_html' => $sideCartHtml,
+            ]);
+        }
+
+        return $sideCartHtml;
+    }
+
+    public function cart_remove(Request $request)
+    {
+        Cart::instance('shopping')->update($request->id, 0);
+        $data = Cart::instance('shopping')->content();
+
+        if ($request->ajax() || $request->wantsJson()) {
+            $cartCount = Cart::instance('shopping')->count();
+            $subtotal = Cart::instance('shopping')->subtotal();
+            $subtotal = str_replace(',', '', $subtotal);
+            $subtotal = str_replace('.00', '', $subtotal);
+            $items = $data;
+            $sideCartHtml = view('frontEnd.layouts.partials.side_cart_items', compact('items', 'subtotal'))->render();
+
+            if ($request->header('X-Side-Cart') || $request->input('source') === 'side_cart') {
+                return response()->json([
+                    'status' => 'success',
+                    'cart_count' => $cartCount,
+                    'subtotal' => $subtotal,
+                    'side_cart_html' => $sideCartHtml,
+                ]);
+            }
+        }
+
+        return view('frontEnd.layouts.ajax.cart', compact('data'));
+    }
+
+    public function cart_increment(Request $request)
+    {
+        $item = Cart::instance('shopping')->get($request->id);
+        if ($item) {
+            $qty = $item->qty + 1;
+            Cart::instance('shopping')->update($request->id, $qty);
+        }
+        $data = Cart::instance('shopping')->content();
+
+        if ($request->ajax() || $request->wantsJson()) {
+            $cartCount = Cart::instance('shopping')->count();
+            $subtotal = Cart::instance('shopping')->subtotal();
+            $subtotal = str_replace(',', '', $subtotal);
+            $subtotal = str_replace('.00', '', $subtotal);
+            $items = $data;
+            $sideCartHtml = view('frontEnd.layouts.partials.side_cart_items', compact('items', 'subtotal'))->render();
+
+            if ($request->header('X-Side-Cart') || $request->input('source') === 'side_cart') {
+                return response()->json([
+                    'status' => 'success',
+                    'cart_count' => $cartCount,
+                    'subtotal' => $subtotal,
+                    'side_cart_html' => $sideCartHtml,
+                ]);
+            }
+        }
+
+        return view('frontEnd.layouts.ajax.cart', compact('data'));
+    }
+
+    public function cart_decrement(Request $request)
+    {
+        $item = Cart::instance('shopping')->get($request->id);
+        if ($item) {
+            $qty = max(1, $item->qty - 1);
+            Cart::instance('shopping')->update($request->id, $qty);
+        }
+        $data = Cart::instance('shopping')->content();
+
+        if ($request->ajax() || $request->wantsJson()) {
+            $cartCount = Cart::instance('shopping')->count();
+            $subtotal = Cart::instance('shopping')->subtotal();
+            $subtotal = str_replace(',', '', $subtotal);
+            $subtotal = str_replace('.00', '', $subtotal);
+            $items = $data;
+            $sideCartHtml = view('frontEnd.layouts.partials.side_cart_items', compact('items', 'subtotal'))->render();
+
+            if ($request->header('X-Side-Cart') || $request->input('source') === 'side_cart') {
+                return response()->json([
+                    'status' => 'success',
+                    'cart_count' => $cartCount,
+                    'subtotal' => $subtotal,
+                    'side_cart_html' => $sideCartHtml,
+                ]);
+            }
+        }
+
+        return view('frontEnd.layouts.ajax.cart', compact('data'));
+    }
+
+    public function cart_count(Request $request)
+    {
+        $data = Cart::instance('shopping')->count();
+
+        return view('frontEnd.layouts.ajax.cart_count', compact('data'));
+    }
+
+    public function cart_show()
+    {
+        $shippingcharge = ShippingCharge::where('status', 1)->get();
+        $select_charge = ShippingCharge::where('status', 1)->first();
+        $bkash_gateway = PaymentGateway::where(['status' => 1, 'type' => 'bkash'])->first();
+        $shurjopay_gateway = PaymentGateway::where(['status' => 1, 'type' => 'shurjopay'])->first();
+        Session::put('shipping', $select_charge->amount);
+
+        return view('frontEnd.layouts.customer.cart', compact('shippingcharge', 'bkash_gateway', 'shurjopay_gateway'));
+    }
+
+    public function mobilecart_qty(Request $request)
+    {
+        $data = Cart::instance('shopping')->count();
+
+        return view('frontEnd.layouts.ajax.mobilecart_qty', compact('data'));
+    }
+}

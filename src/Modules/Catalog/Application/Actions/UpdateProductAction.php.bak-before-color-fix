@@ -1,0 +1,39 @@
+<?php
+
+namespace Modules\Catalog\Application\Actions;
+
+use App\Models\Product;
+use Illuminate\Support\Facades\DB;
+use Modules\Catalog\Application\DTOs\ProductDTO;
+use Modules\Catalog\Domain\Contracts\ProductRepositoryInterface;
+use Shared\Domain\Exceptions\EntityNotFoundException;
+
+class UpdateProductAction
+{
+    public function __construct(
+        private ProductRepositoryInterface $productRepository
+    ) {}
+
+    public function execute(int|string $productId, array $data, ?array $colorIds = null, ?array $sizeIds = null): ProductDTO
+    {
+        return DB::transaction(function () use ($productId, $data, $colorIds, $sizeIds) {
+            $product = Product::find($productId);
+            if (!$product) {
+                throw EntityNotFoundException::forEntity('Product', $productId);
+            }
+
+            $product->update($data);
+
+            if ($colorIds !== null) {
+                $product->colors()->sync($colorIds);
+            }
+
+            if ($sizeIds !== null) {
+                $product->sizes()->sync($sizeIds);
+            }
+
+            $entity = $this->productRepository->findById($product->id);
+            return ProductDTO::fromEntity($entity);
+        });
+    }
+}

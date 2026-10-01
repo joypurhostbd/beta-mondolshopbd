@@ -1,0 +1,77 @@
+<?php
+
+namespace Modules\Catalog\Application\Actions;
+
+use App\Models\Product;
+use Illuminate\Support\Facades\DB;
+use Modules\Catalog\Application\DTOs\ProductDTO;
+use Modules\Catalog\Domain\Contracts\ProductRepositoryInterface;
+use Shared\Domain\Exceptions\EntityNotFoundException;
+
+class UpdateProductAction
+{
+    public function __construct(
+        private ProductRepositoryInterface $productRepository
+    ) {}
+
+    public function execute(
+        int|string $productId,
+        array $data,
+        ?array $colorIds = null,
+        ?array $sizeIds = null
+    ): ProductDTO {
+        // Keep only valid numeric color IDs.
+        if ($colorIds !== null) {
+            $colorIds = array_values(array_filter(
+                $colorIds,
+                fn ($id) => is_numeric($id) && (int) $id > 0
+            ));
+
+            $colorIds = array_map('intval', $colorIds);
+        }
+
+        // Keep only valid numeric size IDs.
+        if ($sizeIds !== null) {
+            $sizeIds = array_values(array_filter(
+                $sizeIds,
+                fn ($id) => is_numeric($id) && (int) $id > 0
+            ));
+
+            $sizeIds = array_map('intval', $sizeIds);
+        }
+
+        return DB::transaction(function () use (
+            $productId,
+            $data,
+            $colorIds,
+            $sizeIds
+        ) {
+            $product = Product::find($productId);
+
+            if (!$product) {
+                throw EntityNotFoundException::forEntity('Product', $productId);
+            }
+
+            $product->update($data);
+
+            /*
+             * Only sync colors when the form actually contains proColor.
+             * Empty proColor means remove all colors.
+             */
+            if ($colorIds !== null) {
+                $product->colors()->sync($colorIds);
+            }
+
+            /*
+             * Only sync sizes when the form actually contains proSize.
+             */
+            if ($sizeIds !== null) {
+                $product->sizes()->sync($sizeIds);
+            }
+
+            $entity = $this->productRepository->findById($product->id);
+
+            return ProductDTO::fromEntity($entity);
+        });
+    }
+}

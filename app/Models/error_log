@@ -1,0 +1,4 @@
+[04-Apr-2026 04:57:40 UTC] PHP Fatal error:  Uncaught Error: Class "Illuminate\Foundation\Auth\User" not found in /home/mondolsh/public_html/app/Models/User.php:12
+Stack trace:
+#0 {main}
+  thrown in /home/mondolsh/public_html/app/Models/User.php on line 12

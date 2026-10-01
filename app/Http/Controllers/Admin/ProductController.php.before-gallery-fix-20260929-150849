@@ -1,0 +1,458 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Http\Requests\Admin\ProductStoreRequest;
+use App\Http\Requests\Admin\ProductUpdateRequest;
+use App\Models\Product;
+use App\Models\Productimage;
+use App\Models\Productprice;
+use App\Models\Productcolor;
+use App\Models\Productsize;
+use App\Models\Category;
+use App\Models\Subcategory;
+use App\Models\Childcategory;
+use App\Models\Brand;
+use App\Models\Color;
+use App\Models\Size;
+use Modules\Catalog\Application\Actions\CreateProductAction;
+use Modules\Catalog\Application\Actions\UpdateProductAction;
+use Modules\Catalog\Application\Actions\ToggleProductStatusAction;
+use Toastr;
+use File;
+use Str;
+use Image;
+use DB;
+
+class ProductController extends Controller
+{
+    public function getSubcategory(Request $request)
+    {
+        $subcategory = DB::table("subcategories")
+        ->where("category_id", $request->category_id)
+        ->pluck('subcategoryName', 'id');
+        return response()->json($subcategory);
+    }
+    public function getChildcategory(Request $request)
+    {
+        $childcategory = DB::table("childcategories")
+        ->where("subcategory_id", $request->subcategory_id)
+        ->pluck('childcategoryName', 'id');
+        return response()->json($childcategory);
+    }
+    
+    
+    function __construct()
+    {
+         $this->middleware('permission:product-list|product-create|product-edit|product-delete', ['only' => ['index','show']]);
+         $this->middleware('permission:product-create', ['only' => ['create','store']]);
+         $this->middleware('permission:product-edit', ['only' => ['edit','update','price_edit','price_update']]);
+         $this->middleware('permission:product-delete', ['only' => ['destroy']]);
+    }
+    
+    
+    public function index(Request $request)
+    {
+        $query = Product::orderBy('id', 'DESC')->with('image', 'featuredImage', 'category');
+
+        if ($request->filled('keyword')) {
+            $kw = trim($request->keyword);
+            $query->where(function ($q) use ($kw) {
+                $q->where('name', 'LIKE', '%' . $kw . '%')
+                    ->orWhere('product_code', 'LIKE', '%' . $kw . '%')
+                    ->orWhere('pro_barcode', 'LIKE', '%' . $kw . '%')
+                    ->orWhere('id', $kw);
+            });
+        }
+
+        if ($request->filled('category_id')) {
+            $query->where('category_id', $request->category_id);
+        }
+
+        if ($request->filled('status') && $request->status !== '') {
+            $query->where('status', (int) $request->status);
+        }
+
+        $data = $query->paginate(50)->appends($request->query());
+
+        $total_products = Product::count();
+        $total_active = Product::where('status', 1)->count();
+        $low_stock_count = Product::where('stock', '<=', 5)->count();
+        $deals_count = Product::where('topsale', 1)->orWhere('feature_product', 1)->count();
+        $categories = Category::where('parent_id', 0)->where('status', 1)->select('id', 'name')->orderBy('name', 'asc')->get();
+
+        return view('backEnd.product.index', compact(
+            'data',
+            'total_products',
+            'total_active',
+            'low_stock_count',
+            'deals_count',
+            'categories'
+        ));
+    }
+    public function create()
+    {
+        $categories = Category::where('parent_id','=','0')->where('status',1)->select('id','name','status')->with('childrenCategories')->get();
+        $brands = Brand::where('status','1')->select('id','name','status')->get();
+        $colors = Color::where('status','1')->get();
+        $sizes = Size::where('status','1')->get();
+        return view('backEnd.product.create',compact('categories','brands','colors','sizes'));
+    }
+    public function store(ProductStoreRequest $request)
+    {
+        $data = $request->except(['image','files','featured_image','proSize','proColor']);
+        $data['status'] = $request->status ? 1 : 0;
+        $data['topsale'] = $request->topsale ? 1 : 0;
+        $data['feature_product'] = $request->feature_product ? 1 : 0;
+
+        $product = app(CreateProductAction::class)->execute(
+            $data,
+            $request->proSize ?? [],
+            $request->proColor ?? []
+        );
+
+        /*
+         * PRODUCT IMAGE LOGIC
+         *
+         * IMPORTANT:
+         * A newly created product can ONLY receive images
+         * uploaded in the CURRENT request.
+         *
+         * No old Productimage record is queried or reused.
+         */
+
+        $images = $request->file('image', []);
+
+        // Normalize a single upload to an array.
+        if ($images instanceof \Illuminate\Http\UploadedFile) {
+            $images = [$images];
+        }
+
+        if (!is_array($images)) {
+            $images = [];
+        }
+
+        /*
+         * Keep the IDs of images created during THIS request.
+         * This prevents any old image from becoming Featured.
+         */
+        $newGalleryImageIds = [];
+
+        // Upload ONLY gallery images submitted in this request.
+        foreach ($images as $image) {
+
+            if (
+                !($image instanceof \Illuminate\Http\UploadedFile) ||
+                !$image->isValid()
+            ) {
+                continue;
+            }
+
+            $name = time() . '-' . Str::random(20) . '.' .
+                strtolower($image->getClientOriginalExtension());
+
+            $uploadPath = 'uploads/product/';
+
+            $image->move($uploadPath, $name);
+
+            $newImage = Productimage::create([
+                'product_id' => $product->id,
+                'image' => $uploadPath . $name,
+                'is_featured' => false,
+            ]);
+
+            $newGalleryImageIds[] = $newImage->id;
+        }
+
+        /*
+         * Upload ONLY a separately selected Featured Image.
+         */
+        $newFeatured = $request->file('featured_image');
+
+        if (
+            $newFeatured instanceof \Illuminate\Http\UploadedFile &&
+            $newFeatured->isValid()
+        ) {
+
+            $name = time() . '-featured-' . Str::random(20) . '.' .
+                strtolower($newFeatured->getClientOriginalExtension());
+
+            $uploadPath = 'uploads/product/';
+
+            $newFeatured->move($uploadPath, $name);
+
+            /*
+             * Only this newly-created product's images are affected.
+             * Since this is a NEW product, there should be no old
+             * image attached to it.
+             */
+            Productimage::where('product_id', $product->id)
+                ->update(['is_featured' => false]);
+
+            Productimage::create([
+                'product_id' => $product->id,
+                'image' => $uploadPath . $name,
+                'is_featured' => true,
+            ]);
+
+        } elseif (!empty($newGalleryImageIds)) {
+
+            /*
+             * No separate Featured Image was uploaded.
+             *
+             * Make the FIRST image created during THIS request
+             * Featured. We do NOT search the database for an image.
+             */
+            Productimage::whereIn('id', [$newGalleryImageIds[0]])
+                ->update(['is_featured' => true]);
+        }
+
+        Toastr::success('Success','Data update successfully');
+        return redirect()->route('products.index');
+    }
+ 
+    public function edit($id)
+    {
+        $product = Product::with(['images', 'colors', 'sizes'])->findOrFail($id);
+
+        $categories = Category::where('parent_id', 0)
+            ->where('status', 1)
+            ->select('id', 'name', 'status')
+            ->with('childrenCategories')
+            ->get();
+
+        $brands = Brand::where('status', 1)
+            ->select('id', 'name', 'status')
+            ->get();
+
+        $subcategory = DB::table('subcategories')
+            ->where('status', 1)
+            ->select('id', 'subcategoryName', 'category_id')
+            ->get();
+
+        $childcategory = DB::table('childcategories')
+            ->where('status', 1)
+            ->select('id', 'childcategoryName', 'subcategory_id')
+            ->get();
+
+        $colors = Color::where('status', 1)->get();
+        $sizes = Size::where('status', 1)->get();
+
+        // Variables required by product edit Blade
+        $totalcolors = $colors;
+        $totalsizes = $sizes;
+        $selectcolors = $product->colors ?? collect();
+        $selectsizes = $product->sizes ?? collect();
+
+        return view('backEnd.product.edit', compact(
+            'product',
+            'categories',
+            'brands',
+            'subcategory',
+            'childcategory',
+            'colors',
+            'sizes',
+            'totalcolors',
+            'totalsizes',
+            'selectcolors',
+            'selectsizes'
+        ));
+    }
+
+    public function update(ProductUpdateRequest $request)
+    {
+        $productId = $request->input('id');
+
+        if (!$productId) {
+            $productId = $request->input('hidden_id');
+        }
+
+        $product = Product::findOrFail($productId);
+
+        $data = $request->except([
+            'image',
+            'files',
+            'featured_image',
+            'featured_image_id',
+            'proSize',
+            'proColor',
+            '_token',
+            '_method',
+            'id',
+            'hidden_id',
+        ]);
+
+        $data['status'] = $request->status ? 1 : 0;
+        $data['topsale'] = $request->topsale ? 1 : 0;
+        $data['feature_product'] = $request->feature_product ? 1 : 0;
+
+        app(UpdateProductAction::class)->execute(
+            $product->id,
+            $data,
+            $request->has('proColor') ? ($request->proColor ?? []) : null,
+            $request->has('proSize') ? ($request->proSize ?? []) : null
+        );
+
+        /*
+         * EXISTING GALLERY IMAGE AS FEATURED
+         */
+        if ($request->filled('featured_image_id')) {
+
+            Productimage::where('product_id', $product->id)
+                ->update(['is_featured' => false]);
+
+            Productimage::where('id', $request->featured_image_id)
+                ->where('product_id', $product->id)
+                ->update(['is_featured' => true]);
+        }
+
+        /*
+         * NEW SEPARATE FEATURED IMAGE
+         */
+        $newFeatured = $request->file('featured_image');
+
+        if ($newFeatured) {
+
+            Productimage::where('product_id', $product->id)
+                ->update(['is_featured' => false]);
+
+            $name = time() . '-featured-' . Str::random(10) . '.' .
+                $newFeatured->getClientOriginalExtension();
+
+            $name = strtolower(preg_replace('/\s+/', '-', $name));
+
+            $uploadPath = 'uploads/product/';
+
+            $newFeatured->move($uploadPath, $name);
+
+            Productimage::create([
+                'product_id' => $product->id,
+                'image' => $uploadPath . $name,
+                'is_featured' => true,
+            ]);
+        }
+
+        /*
+         * NEW GALLERY IMAGES ONLY
+         */
+        $images = $request->file('image');
+
+        if ($images) {
+
+            foreach ($images as $image) {
+
+                if (!$image) {
+                    continue;
+                }
+
+                $name = time() . '-' . Str::random(10) . '.' .
+                    $image->getClientOriginalExtension();
+
+                $name = strtolower(preg_replace('/\s+/', '-', $name));
+
+                $uploadPath = 'uploads/product/';
+
+                $image->move($uploadPath, $name);
+
+                Productimage::create([
+                    'product_id' => $product->id,
+                    'image' => $uploadPath . $name,
+                    'is_featured' => false,
+                ]);
+            }
+        }
+
+        /*
+         * SAFETY:
+         * If there are images but no featured image,
+         * make the first existing image featured.
+         */
+        $hasFeatured = Productimage::where('product_id', $product->id)
+            ->where('is_featured', true)
+            ->exists();
+
+        if (!$hasFeatured) {
+
+            $firstImage = Productimage::where('product_id', $product->id)
+                ->orderBy('id')
+                ->first();
+
+            if ($firstImage) {
+                $firstImage->update(['is_featured' => true]);
+            }
+        }
+
+        Toastr::success('Success', 'Data update successfully');
+
+        return redirect()->route('products.index');
+    }
+
+    public function inactive(Request $request)
+    {
+        $inactive = Product::find($request->hidden_id);
+        $inactive->status = 0;
+        $inactive->save();
+        Toastr::success('Success','Data inactive successfully');
+        return redirect()->back();
+    }
+    public function active(Request $request)
+    {
+        $active = Product::find($request->hidden_id);
+        $active->status = 1;
+        $active->save();
+        Toastr::success('Success','Data active successfully');
+        return redirect()->back();
+    }
+    public function destroy(Request $request)
+    {
+        $delete_data = Product::find($request->hidden_id);
+        $delete_data->delete();
+        Toastr::success('Success','Data delete successfully');
+        return redirect()->back();
+    }
+    public function imgdestroy(Request $request)
+    {
+        $delete_data = Productimage::find($request->id);
+        if (!$delete_data) {
+            Toastr::error('Error', 'Image not found');
+            return redirect()->back();
+        }
+
+        $productId = $delete_data->product_id;
+        $wasFeatured = $delete_data->is_featured;
+
+        File::delete($delete_data->image);
+        $delete_data->delete();
+
+        // If deleted image was featured, promote the next available image
+        if ($wasFeatured) {
+            $nextImage = Productimage::where('product_id', $productId)->first();
+            if ($nextImage) {
+                $nextImage->update(['is_featured' => true]);
+            }
+        }
+
+        Toastr::success('Success','Image deleted successfully');
+        return redirect()->back();
+    }
+    public function pricedestroy(Request $request)
+    { 
+        $delete_data = Productprice::find($request->id);
+        $delete_data->delete();
+        Toastr::success('Success','Product price delete successfully');
+        return redirect()->back();
+    }
+    public function update_deals(Request $request){
+        $products = Product::whereIn('id', $request->input('product_ids'))->update(['topsale' => $request->status]);
+        return response()->json(['status'=>'success','message'=>'Hot deals product status change']);
+    }
+    public function update_feature(Request $request){
+        $products = Product::whereIn('id', $request->input('product_ids'))->update(['feature_product' => $request->status]);
+        return response()->json(['status'=>'success','message'=>'Feature product status change']);
+    }
+    public function update_status(Request $request){
+        $products = Product::whereIn('id', $request->input('product_ids'))->update(['status' => $request->status]);
+        return response()->json(['status'=>'success','message'=>'Product status change successfully']);
+    }
+}

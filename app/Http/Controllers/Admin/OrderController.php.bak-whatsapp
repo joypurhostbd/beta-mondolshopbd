@@ -1,0 +1,1859 @@
+<?php
+
+namespace App\Http\Controllers\Admin;
+
+use App\Enums\OrderStatusEnum;
+use App\Enums\PaymentStatusEnum;
+use App\Events\OrderPlaced;
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Admin\AdminOrderStoreRequest;
+use App\Http\Requests\Admin\AdminOrderUpdateRequest;
+use App\Jobs\SendSmsJob;
+use App\Models\Category;
+use App\Models\Contact;
+use App\Models\Courierapi;
+use App\Models\Customer;
+use App\Models\GeneralSetting;
+use App\Models\IncompleteOrder;
+use App\Models\Order;
+use App\Models\OrderDetails;
+use App\Models\OrderStatus;
+use App\Models\Payment;
+use App\Models\Product;
+use App\Models\Shipping;
+use App\Models\ShippingCharge;
+use App\Models\SmsGateway;
+use App\Models\User;
+use App\Services\CartService;
+use App\Services\OutboxService;
+use App\Services\SteadfastCourierService;
+use App\Services\FraudCheckService;
+use App\ValueObjects\Phone;
+use Carbon\Carbon;
+use DB;
+use GuzzleHttp\Client;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Str;
+use Modules\Shipping\Application\Actions\SyncCourierOrderStatusAction;
+use Session;
+use Shared\Infrastructure\Views\ViewModels\InvoiceViewModel;
+use Toastr;
+use Yajra\DataTables\Facades\DataTables;
+
+class OrderController extends Controller
+{
+    public function index($slug, Request $request)
+    {
+        $all_statuses = OrderStatus::where('status', 1)->withCount('orders')->orderBy('id', 'asc')->get();
+
+        // Accurately calculate order counts for courier filter tabs with single query
+        $courierCounts = Order::getCourierCounts();
+        foreach ($all_statuses as $st) {
+            if (Order::isCourierFilterSlug($st->slug)) {
+                $st->orders_count = $courierCounts[$st->slug] ?? 0;
+            }
+        }
+
+        $total_all_orders = Order::count();
+        $active_orders_query = Order::filterByStatusSlug($slug);
+
+        if ($slug == 'all') {
+            $order_status = (object) [
+                'name' => 'All',
+                'orders_count' => $total_all_orders,
+            ];
+        } elseif (Order::isCourierFilterSlug($slug)) {
+            $order_status = (object) [
+                'name' => Order::getCourierFilterName($slug),
+                'orders_count' => (clone $active_orders_query)->count(),
+            ];
+        } else {
+            $order_status = OrderStatus::where('slug', $slug)->withCount('orders')->first();
+            if (! $order_status) {
+                $order_status = (object) [
+                    'name' => ucfirst(str_replace('-', ' ', $slug)),
+                    'orders_count' => 0,
+                ];
+            }
+        }
+
+        $status_total_amount = (clone $active_orders_query)->sum('amount') ?? 0;
+        $status_dispatched_count = (clone $active_orders_query)->where(function ($q) {
+            $q->whereNotNull('consignment_id')->where('consignment_id', '!=', '')
+                ->orWhereNotNull('tracking_code')->where('tracking_code', '!=', '');
+        })->count();
+        $status_today_count = (clone $active_orders_query)->where('created_at', '>=', Carbon::today())->count();
+
+        $users = User::get();
+        $steadfast = Courierapi::where(['status' => 1, 'type' => 'steadfast'])->first();
+        $pathao_info = Courierapi::where(['status' => 1, 'type' => 'pathao'])->select('id', 'type', 'url', 'token', 'status')->first();
+
+        // Pathao courier data
+        $pathaocities = [];
+        $pathaostore = [];
+        if ($pathao_info) {
+            $headers = [
+                'Authorization' => 'Bearer '.$pathao_info->token,
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ];
+            try {
+                $response = Http::withHeaders($headers)->get($pathao_info->url.'/aladdin/api/v1/city-list');
+                $pathaocities = $response->json();
+                $response2 = Http::withHeaders($headers)->get($pathao_info->url.'/aladdin/api/v1/stores');
+                $pathaostore = $response2->json();
+            } catch (\Exception $e) {
+                // Silently fallback on API network issues
+            }
+        }
+
+        return view('backEnd.order.index', compact(
+            'order_status',
+            'users',
+            'steadfast',
+            'pathaostore',
+            'pathaocities',
+            'slug',
+            'all_statuses',
+            'total_all_orders',
+            'status_total_amount',
+            'status_dispatched_count',
+            'status_today_count'
+        ));
+    }
+
+    public function getOrders(Request $request, $slug = 'all')
+    {
+        $orders = Order::latest()->with(['shipping', 'status', 'user', 'customer']);
+
+        // Apply DRY status filtering
+        $orders->filterByStatusSlug($slug);
+
+        // Date filter
+        if ($request->has('from') && ! empty($request->from)) {
+            $orders->whereDate('created_at', '>=', $request->from);
+        }
+        if ($request->has('to') && ! empty($request->to)) {
+            $orders->whereDate('created_at', '<=', $request->to);
+        }
+
+        $cachedStatuses = OrderStatus::where('status', 1)
+            ->whereNotIn('slug', Order::getCourierFilterSlugs())
+            ->get();
+
+        return DataTables::of($orders)
+            ->addColumn('checkbox', function ($order) {
+                return '<input type="checkbox" class="checkbox" value="'.$order->id.'">';
+            })
+            ->addColumn('sl', function ($order) {
+                static $i = 0;
+                $i++;
+
+                return $i;
+            })
+            ->addColumn('action', function ($order) {
+                return '
+                <div class="button-list custom-btn-list d-inline-flex align-items-center flex-nowrap">   
+                    <a href="'.route('admin.order.invoice', ['invoice_id' => $order->invoice_id]).'" title="Invoice" class="btn btn-xs btn-light"><i class="fe-eye"></i></a>
+                    <a href="'.route('admin.order.invoice', ['invoice_id' => $order->invoice_id]).'?pos=true" title="POS" class="btn btn-xs btn-light"><i class="fe-printer"></i></a>
+                    <a href="'.route('admin.order.process', ['invoice_id' => $order->invoice_id]).'" title="Process" class="btn btn-xs btn-light"><i class="fe-settings"></i></a>
+                    <a href="'.route('admin.order.edit', ['invoice_id' => $order->invoice_id]).'" title="Edit" class="btn btn-xs btn-light"><i class="fe-edit"></i></a>
+                    <form method="post" action="'.route('admin.order.destroy').'" class="d-inline">        
+                        <input type="hidden" name="_token" value="'.csrf_token().'">
+                        <input type="hidden" value="'.$order->id.'" name="id">
+                        <button type="submit" title="Delete" class="btn btn-xs btn-light text-danger delete-confirm"><i class="fe-trash-2"></i></button>
+                    </form>
+                </div>';
+            })
+            ->editColumn('invoice_id', function ($order) {
+                $html = '<a href="'.route('admin.order.invoice', ['invoice_id' => $order->invoice_id]).'" class="fw-bold text-primary">#'.e($order->invoice_id).'</a>';
+                if (! empty($order->consignment_id)) {
+                    $code = e($order->consignment_id);
+                    $isPathao = str_starts_with(strtoupper($code), 'PTH') || str_contains(strtolower($code), 'pathao');
+                    $trackingUrl = $isPathao
+                        ? 'https://pathao.com/courier-tracking/?consignment_id='.urlencode($order->consignment_id)
+                        : 'https://steadfast.com.bd/t/'.urlencode($order->consignment_id);
+                    $providerLabel = $isPathao ? 'Pathao' : 'SteadFast';
+
+                    $html .= '<br><a href="'.$trackingUrl.'" target="_blank" class="badge bg-soft-info text-info font-11 text-decoration-none mt-1" title="Track live with '.$providerLabel.'"><i class="fe-truck me-1"></i>'.$code.' <i class="fe-external-link font-10"></i></a>';
+                }
+
+                return $html;
+            })
+            ->editColumn('ip_address', function ($order) {
+                return $order->ip_address ? '<span class="badge bg-soft-secondary text-secondary">'.e($order->ip_address).'</span>' : '<span class="text-muted">-</span>';
+            })
+            ->addColumn('date', function ($order) {
+                return date('d-m-Y', strtotime($order->created_at ?? $order->updated_at)).'<br><small class="text-muted">'.date('h:i:s A', strtotime($order->created_at ?? $order->updated_at)).'</small>';
+            })
+            ->addColumn('name', function ($order) {
+                $name = $order->shipping ? $order->shipping->name : ($order->customer ? $order->customer->name : 'Guest Customer');
+                $address = $order->shipping ? $order->shipping->address : '';
+                $html = '<strong>'.e($name).'</strong>'.($address ? '<p class="text-muted mb-0 font-12">'.e(Str::limit($address, 35)).'</p>' : '');
+
+                if (! empty($order->admin_note)) {
+                    $html .= '<div class="badge bg-soft-warning text-warning text-wrap text-start mt-1 font-11 d-block" title="Admin Note / Hold Reason"><i class="fe-alert-circle me-1"></i><strong>Admin:</strong> '.e(Str::limit($order->admin_note, 50)).'</div>';
+                }
+                if (! empty($order->note)) {
+                    $html .= '<div class="badge bg-soft-secondary text-secondary text-wrap text-start mt-1 font-11 d-block" title="Customer Note"><i class="fe-message-square me-1"></i><strong>Note:</strong> '.e(Str::limit($order->note, 50)).'</div>';
+                }
+
+                return $html;
+            })
+            ->addColumn('phone', function ($order) {
+                $phone = $order->shipping ? $order->shipping->phone : ($order->customer ? $order->customer->phone : null);
+                if (! $phone) {
+                    return '<span class="text-muted">-</span>';
+                }
+                $waPhone = Phone::toWhatsApp($phone);
+                $waMsg = urlencode("Hello, this is regarding your order #{$order->invoice_id} from MondolShopBD.");
+
+                return '<div class="d-flex align-items-center gap-1">
+                        <a href="tel:'.e($phone).'" class="text-dark fw-medium" title="Call Customer">'.e($phone).'</a>
+                        <a href="https://wa.me/'.$waPhone.'?text='.$waMsg.'" target="_blank" class="btn btn-xs btn-outline-success p-0 px-1" title="Chat on WhatsApp">
+                            <i class="fe-message-circle"></i>
+                        </a>
+                    </div>';
+            })
+            ->addColumn('fraud_check', function ($order) {
+                $stats = $order->fraud_report_stats;
+                $total = (int) ($stats['total_parcel'] ?? 0);
+                $delivered = (int) ($stats['total_delivered'] ?? 0);
+                $canceled = (int) ($stats['total_cancel'] ?? 0);
+                $rate = (float) ($stats['delivery_rate'] ?? 0);
+
+                $breakdownParts = [];
+                if (! empty($stats['courier_breakdown'])) {
+                    foreach ($stats['courier_breakdown'] as $cName => $cData) {
+                        $cOrders = (int) ($cData['orders'] ?? $cData['Total Parcels'] ?? 0);
+                        $cDelivered = (int) ($cData['delivered'] ?? $cData['Delivered Parcels'] ?? 0);
+                        if ($cOrders > 0) {
+                            $breakdownParts[] = "{$cName}: {$cDelivered}/{$cOrders}";
+                        }
+                    }
+                }
+                $tooltipTitle = ! empty($breakdownParts)
+                    ? 'Breakdown: '.implode(' | ', $breakdownParts)
+                    : "Courier Delivery Rate: {$rate}%";
+
+                return '
+                <div class="order-guard-box" id="order-guard-'.$order->id.'" style="min-width: 165px; max-width: 195px;">
+                    <div class="d-flex align-items-center justify-content-between gap-1 mb-1">
+                        <div class="order-guard-progress flex-grow-1" style="height: 7px; background-color: #e2e8f0; border-radius: 4px; overflow: hidden;">
+                            <div class="order-guard-progress-bar" style="width: '.$rate.'%; height: 100%; background: linear-gradient(90deg, #6366f1, #5e35b1); border-radius: 4px; transition: width 0.4s ease;" aria-valuenow="'.$rate.'" aria-valuemin="0" aria-valuemax="100"></div>
+                        </div>
+                        <button type="button" class="btn btn-xs btn-link p-0 text-muted btn-refresh-order-guard ms-1" data-order-id="'.$order->id.'" title="Re-check Courier Delivery Report">
+                            <i class="fe-refresh-cw font-12"></i>
+                        </button>
+                        <span class="order-guard-logo ms-1 d-inline-flex align-items-center cursor-pointer" data-bs-toggle="tooltip" data-bs-placement="top" title="'.e($tooltipTitle).'">
+                            <svg width="18" height="13" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M2 7L10 3L21 6L12 10L2 7Z" stroke="#475569" stroke-width="2" stroke-linejoin="round"/>
+                                <path d="M6 12L10 19L22 5" stroke="#10b981" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+                            </svg>
+                        </span>
+                    </div>
+                    <div class="order-guard-stats text-center font-11 fw-semibold text-nowrap" style="letter-spacing: -0.2px;">
+                        <span class="text-secondary">ALL: <strong class="guard-all text-dark">'.$total.'</strong></span>
+                        <span class="text-muted mx-1">|</span>
+                        <span class="text-success">DLVD: <strong class="guard-dlvd">'.$delivered.'</strong></span>
+                        <span class="text-muted mx-1">|</span>
+                        <span class="text-danger">CANCL: <strong class="guard-cancl">'.$canceled.'</strong></span>
+                    </div>
+                </div>';
+            })
+            ->addColumn('assign', function ($order) {
+                return $order->user ? '<span class="badge bg-soft-info text-info">'.e($order->user->name).'</span>' : '<span class="text-muted">Unassigned</span>';
+            })
+            ->editColumn('amount', function ($order) {
+                return '<strong>৳'.number_format($order->amount, 2).'</strong>';
+            })
+            ->addColumn('status', function ($order) use ($cachedStatuses) {
+                if ($order->isCourierDispatched()) {
+                    $courierStatus = strtolower((string) ($order->courier_status ?? 'in_review'));
+                    $badgeStyle = match ($courierStatus) {
+                        'delivered', 'completed', 'successful' => 'bg-soft-success text-success border-success',
+                        'partial_delivered', 'partial' => 'bg-soft-warning text-warning border-warning',
+                        'cancelled', 'canceled', 'return', 'returned', 'cancelled_approval_pending' => 'bg-soft-danger text-danger border-danger',
+                        'hold' => 'bg-soft-warning text-warning border-warning',
+                        'in_transit', 'shipped' => 'bg-soft-primary text-primary border-primary',
+                        'picked', 'in_review', 'pending' => 'bg-soft-info text-info border-info',
+                        default => 'bg-soft-info text-info border-info',
+                    };
+                    $statusLabel = ucwords(str_replace('_', ' ', $courierStatus));
+                    $courierName = $order->courier_display_name;
+
+                    return '<div class="input-group input-group-sm" style="min-width: 135px;">
+                            <span class="form-control form-control-sm text-truncate d-flex align-items-center gap-1 '.$badgeStyle.'" title="'.e($courierName).' Status: '.e($statusLabel).' (Courier Locked)">
+                                <i class="fe-truck font-11"></i> <strong class="text-truncate font-12">'.e($statusLabel).'</strong>
+                                <i class="fe-lock ms-auto font-10 text-muted" title="Status is managed by '.e($courierName).'"></i>
+                            </span>
+                            <button type="button" class="btn btn-outline-info btn-sync-courier px-2" data-order-id="'.$order->id.'" title="Sync live status from '.e($courierName).'">
+                                <i class="fe-refresh-cw font-11"></i>
+                            </button>
+                        </div>';
+                }
+
+                $html = '<select class="form-select form-select-sm status-change" data-order-id="'.$order->id.'">';
+                foreach ($cachedStatuses as $status) {
+                    $selected = ($order->order_status == $status->id) ? 'selected' : '';
+                    $html .= '<option value="'.$status->id.'" '.$selected.'>'.$status->name.'</option>';
+                }
+                $html .= '</select>';
+
+                return $html;
+            })
+            ->filterColumn('name', function ($query, $keyword) {
+                $query->whereHas('shipping', function ($q) use ($keyword) {
+                    $q->where('name', 'like', "%{$keyword}%");
+                })->orWhereHas('customer', function ($q) use ($keyword) {
+                    $q->where('name', 'like', "%{$keyword}%");
+                });
+            })
+            ->filterColumn('phone', function ($query, $keyword) {
+                $query->whereHas('shipping', function ($q) use ($keyword) {
+                    $q->where('phone', 'like', "%{$keyword}%");
+                })->orWhereHas('customer', function ($q) use ($keyword) {
+                    $q->where('phone', 'like', "%{$keyword}%");
+                });
+            })
+            ->rawColumns(['checkbox', 'invoice_id', 'ip_address', 'status', 'action', 'date', 'name', 'phone', 'assign', 'amount', 'fraud_check'])
+            ->make(true);
+    }
+
+    private function syncStockAndPaymentOnStatusChange(Order $order, int $oldStatusId, int $newStatusId): void
+    {
+        $completedStatusIds = OrderStatus::whereIn('slug', ['completed', 'delivered'])->pluck('id')->toArray();
+        $cancelledStatusIds = OrderStatus::where('slug', 'cancelled')->pluck('id')->toArray();
+
+        $isNewCompleted = in_array($newStatusId, $completedStatusIds, true);
+        $isOldCompleted = in_array($oldStatusId, $completedStatusIds, true);
+        $isNewCancelled = in_array($newStatusId, $cancelledStatusIds, true);
+
+        if ($isNewCompleted && ! $isOldCompleted) {
+            $orderDetails = OrderDetails::select('id', 'order_id', 'product_id', 'qty')->where('order_id', $order->id)->get();
+            foreach ($orderDetails as $detail) {
+                $product = Product::find($detail->product_id);
+                if ($product) {
+                    $product->stock = max(0, $product->stock - (int) $detail->qty);
+                    $product->save();
+                }
+            }
+
+            $order->payment_status = 'paid';
+            $order->save();
+            Payment::where('order_id', $order->id)->update(['payment_status' => 'paid']);
+        } elseif ($isNewCancelled) {
+            if ($isOldCompleted) {
+                $orderDetails = OrderDetails::select('id', 'order_id', 'product_id', 'qty')->where('order_id', $order->id)->get();
+                foreach ($orderDetails as $detail) {
+                    $product = Product::find($detail->product_id);
+                    if ($product) {
+                        $product->stock += (int) $detail->qty;
+                        $product->save();
+                    }
+                }
+            }
+
+            $order->payment_status = 'cancelled';
+            $order->save();
+            Payment::where('order_id', $order->id)->update(['payment_status' => 'cancelled']);
+        }
+    }
+
+    public function updateStatus(Request $request)
+    {
+        try {
+            $order = Order::findOrFail($request->order_id);
+
+            if ($order->isCourierDispatched()) {
+                return response()->json([
+                    'success' => false,
+                    'msg' => 'Order #'.$order->invoice_id.' is dispatched to courier and cannot be changed manually.',
+                ], 422);
+            }
+
+            $oldStatus = (int) $order->order_status;
+            $newStatus = (int) $request->status_id;
+            $order->order_status = $newStatus;
+            $order->save();
+
+            $this->syncStockAndPaymentOnStatusChange($order, $oldStatus, $newStatus);
+
+            return response()->json(['success' => true]);
+        } catch (\Exception $e) {
+            return response()->json(['success' => false, 'msg' => $e->getMessage()], 500);
+        }
+    }
+
+    public function incomplete()
+    {
+        $datas = IncompleteOrder::latest()->get();
+        $total_leads = $datas->count();
+        $today_leads = IncompleteOrder::where('created_at', '>=', Carbon::today())->count();
+        $leads_with_phone = $datas->filter(fn ($d) => ! empty($d->phone))->count();
+
+        $total_recoverable_amount = 0;
+        foreach ($datas as $lead) {
+            $items = is_string($lead->data) ? json_decode($lead->data) : (is_array($lead->data) || is_object($lead->data) ? $lead->data : []);
+            if ($items) {
+                foreach ($items as $item) {
+                    $itemObj = (object) $item;
+                    $qty = (int) ($itemObj->qty ?? 1);
+                    $price = (float) ($itemObj->price ?? 0);
+                    $total_recoverable_amount += ($price * $qty);
+                }
+            }
+        }
+
+        return view('backEnd.order.incomplete', compact('datas', 'total_leads', 'today_leads', 'leads_with_phone', 'total_recoverable_amount'));
+    }
+
+    public function incomplete_delete($id)
+    {
+        $datas = IncompleteOrder::find($id);
+        if ($datas) {
+            $datas->delete();
+            Toastr::success('Incomplete order removed successfully.');
+        } else {
+            Toastr::error('Incomplete order not found.');
+        }
+
+        return redirect()->back();
+    }
+
+    public function incomplete_bulk_delete(Request $request)
+    {
+        $ids = $request->input('ids', []);
+        if (is_array($ids) && count($ids) > 0) {
+            IncompleteOrder::whereIn('id', $ids)->delete();
+            Toastr::success(count($ids).' abandoned leads removed successfully.', 'Success');
+        } else {
+            Toastr::warning('No leads were selected for deletion.', 'Notice');
+        }
+
+        return redirect()->back();
+    }
+
+    public function incomplete_convert($id)
+    {
+        $incomplete = IncompleteOrder::findOrFail($id);
+
+        $phone = Phone::normalize($incomplete->phone);
+        if (empty($phone)) {
+            Toastr::warning('Customer phone number is missing or invalid. Please update phone before converting.', 'Phone Required');
+
+            return redirect()->back();
+        }
+
+        $cartItems = is_array($incomplete->data) ? $incomplete->data : json_decode($incomplete->data, true);
+        if (empty($cartItems)) {
+            $cartItems = json_decode($incomplete->data);
+        }
+
+        if (empty($cartItems)) {
+            Toastr::error('No items found in this incomplete order.', 'Error');
+
+            return redirect()->back();
+        }
+
+        $subtotal = 0;
+        foreach ($cartItems as $item) {
+            $itemArr = (array) $item;
+            $subtotal += ((float) ($itemArr['price'] ?? 0) * (int) ($itemArr['qty'] ?? 1));
+        }
+
+        $shippingRecord = ShippingCharge::where('status', 1)->first();
+        $shippingCharge = $shippingRecord ? (float) $shippingRecord->amount : 100.0;
+        $totalAmount = $subtotal + $shippingCharge;
+
+        try {
+            $order = DB::transaction(function () use ($incomplete, $phone, $cartItems, $subtotal, $shippingCharge, $totalAmount, $shippingRecord) {
+                $customer = Customer::where('phone', $phone)->first();
+                if (! $customer) {
+                    $autoPassword = (string) rand(111111, 999999);
+                    $customer = Customer::create([
+                        'name' => $incomplete->name ?? 'Guest Buyer',
+                        'slug' => Str::slug($incomplete->name ?? 'guest-buyer').'-'.rand(100, 999),
+                        'phone' => $phone,
+                        'password' => bcrypt($autoPassword),
+                        'verify' => 1,
+                        'status' => 1,
+                    ]);
+                    SmsGateway::sendAutoGeneratedPasswordSms($customer, $autoPassword);
+                }
+
+                $order = new Order;
+                $order->invoice_id = rand(11111, 99999);
+                $order->amount = $totalAmount;
+                $order->discount = 0;
+                $order->shipping_charge = $shippingCharge;
+                $order->customer_id = $customer->id;
+                $order->order_status = 1; // Pending
+                $order->note = 'Converted from Abandoned Cart Lead #'.$incomplete->id;
+                $order->save();
+
+                foreach ($cartItems as $item) {
+                    $itemArr = (array) $item;
+                    $options = isset($itemArr['options']) ? (array) $itemArr['options'] : [];
+                    $imagePath = $options['image'] ?? null;
+                    if (! $imagePath && ! empty($itemArr['id'])) {
+                        $prod = Product::find($itemArr['id']);
+                        $imagePath = $prod?->image?->image ?? '';
+                    }
+
+                    $orderDetail = new OrderDetails;
+                    $orderDetail->order_id = $order->id;
+                    $orderDetail->product_id = $itemArr['id'] ?? 1;
+                    $orderDetail->product_name = $itemArr['name'] ?? 'Product';
+                    $orderDetail->purchase_price = $itemArr['purchase_price'] ?? 0;
+                    $orderDetail->sale_price = $itemArr['price'] ?? 0;
+                    $orderDetail->qty = (int) ($itemArr['qty'] ?? 1);
+                    $orderDetail->product_size = $options['product_size'] ?? null;
+                    $orderDetail->product_color = $options['product_color'] ?? null;
+                    $orderDetail->product_image = $imagePath;
+                    $orderDetail->save();
+
+                    // Atomically decrement stock
+                    if (! empty($itemArr['id'])) {
+                        Product::where('id', $itemArr['id'])->decrement('stock', (int) ($itemArr['qty'] ?? 1));
+                    }
+                }
+
+                $shipping = new Shipping;
+                $shipping->order_id = $order->id;
+                $shipping->customer_id = $customer->id;
+                $shipping->name = $incomplete->name ?? 'Guest Buyer';
+                $shipping->phone = $phone;
+                $shipping->address = $incomplete->address ?? 'Bangladesh';
+                $shipping->area = $shippingRecord ? $shippingRecord->name : 'Inside Dhaka';
+                $shipping->save();
+
+                $payment = new Payment;
+                $payment->order_id = $order->id;
+                $payment->customer_id = $customer->id;
+                $payment->payment_method = 'Cash On Delivery';
+                $payment->amount = $totalAmount;
+                $payment->payment_status = 'pending';
+                $payment->save();
+
+                $incomplete->delete();
+
+                // Record outbox event atomically within transaction (Rule 11)
+                if (class_exists(OutboxService::class)) {
+                    app(OutboxService::class)->record('order.created', [
+                        'order_id' => $order->id,
+                        'invoice_id' => $order->invoice_id,
+                        'customer_id' => $order->customer_id,
+                        'amount' => $order->amount,
+                    ]);
+                }
+
+                return $order;
+            });
+
+            // Dispatch domain event outside transaction with safe error suppression
+            try {
+                event(new OrderPlaced($order));
+            } catch (\Throwable $eventException) {
+                Log::warning('OrderPlaced event listener error during incomplete order conversion: '.$eventException->getMessage(), [
+                    'order_id' => $order->id,
+                ]);
+            }
+
+            Toastr::success("Lead converted successfully into Order #{$order->invoice_id}!", 'Success');
+
+            return redirect()->route('admin.orders', 'pending');
+        } catch (\Throwable $e) {
+            Log::error('Failed to convert abandoned cart lead #'.$id.': '.$e->getMessage(), [
+                'trace' => $e->getTraceAsString(),
+            ]);
+            Toastr::error('Failed to convert abandoned cart: '.$e->getMessage(), 'Error');
+
+            return redirect()->back();
+        }
+    }
+
+    public function incomplete_send_sms($id)
+    {
+        $incomplete = IncompleteOrder::findOrFail($id);
+
+        if (empty($incomplete->phone)) {
+            Toastr::error('Customer phone number is missing.', 'Error');
+
+            return redirect()->back();
+        }
+
+        $name = $incomplete->name ?? 'Valued Customer';
+        $checkoutUrl = url('/checkout');
+        $message = "Dear {$name}, you have left items in your cart at MondolShopBD! Complete your order now: {$checkoutUrl}";
+
+        SendSmsJob::dispatch($incomplete->phone, $message);
+
+        Toastr::success("Recovery SMS dispatched to {$incomplete->phone}!", 'Success');
+
+        return redirect()->back();
+    }
+
+    public function pathaocity(Request $request)
+    {
+        $pathao_info = Courierapi::where(['status' => 1, 'type' => 'pathao'])->select('id', 'type', 'url', 'token', 'status')->first();
+        if ($pathao_info) {
+            $headers = [
+                'Authorization' => 'Bearer '.$pathao_info->token,
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ];
+
+            $response = Http::withHeaders($headers)->get($pathao_info->url.'/aladdin/api/v1/cities/'.$request->city_id.'/zone-list');
+            $pathaozones = $response->json();
+
+            return response()->json($pathaozones);
+        } else {
+            return response()->json([]);
+        }
+    }
+
+    public function pathaozone(Request $request)
+    {
+        $pathao_info = Courierapi::where(['status' => 1, 'type' => 'pathao'])->select('id', 'type', 'url', 'token', 'status')->first();
+        if ($pathao_info) {
+            $headers = [
+                'Authorization' => 'Bearer '.$pathao_info->token,
+                'Content-Type' => 'application/json',
+                'Accept' => 'application/json',
+            ];
+
+            $response = Http::withHeaders($headers)->get($pathao_info->url.'/aladdin/api/v1/zones/'.$request->zone_id.'/area-list');
+            $pathaoareas = $response->json();
+
+            return response()->json($pathaoareas);
+        } else {
+            return response()->json([]);
+        }
+    }
+
+    public function order_pathao(Request $request)
+    {
+        $orders_id = (array) $request->input('order_ids', []);
+        if (empty($orders_id)) {
+            return response()->json(['status' => 'failed', 'message' => 'No orders selected.'], 422);
+        }
+
+        $pathao_info = Courierapi::where(['status' => 1, 'type' => 'pathao'])->select('id', 'type', 'url', 'token', 'status')->first();
+        if (! $pathao_info) {
+            return response()->json(['status' => 'failed', 'message' => 'Pathao API configuration not found or disabled.'], 404);
+        }
+
+        $successCount = 0;
+        $failedCount = 0;
+        $lastErrorMessage = '';
+
+        foreach ($orders_id as $order_id) {
+            $order = Order::with('shipping')->find($order_id);
+            if (! $order || (int) $order->order_status === (int) OrderStatusEnum::Delivered->value) {
+                continue;
+            }
+
+            $itemQuantity = (int) OrderDetails::where('order_id', $order->id)->sum('qty');
+            if ($itemQuantity < 1) {
+                $itemQuantity = 1;
+            }
+
+            $recipientName = $order->shipping ? $order->shipping->name : 'Customer';
+            $recipientPhone = $order->shipping ? $order->shipping->phone : '01700000000';
+            $recipientAddress = $order->shipping ? $order->shipping->address : 'Dhaka';
+
+            try {
+                $response = Http::withHeaders([
+                    'Authorization' => 'Bearer '.$pathao_info->token,
+                    'Accept' => 'application/json',
+                    'Content-Type' => 'application/json',
+                ])->timeout(15)->post(rtrim($pathao_info->url, '/').'/aladdin/api/v1/orders', [
+                    'store_id' => (int) $request->store_id,
+                    'merchant_order_id' => (string) $order->invoice_id,
+                    'recipient_name' => $recipientName,
+                    'recipient_phone' => $recipientPhone,
+                    'recipient_address' => $recipientAddress,
+                    'recipient_city' => (int) $request->city_id,
+                    'recipient_zone' => (int) $request->zone_id,
+                    'recipient_area' => (int) $request->area_id,
+                    'delivery_type' => 48,
+                    'item_type' => 2,
+                    'special_instruction' => 'Special note- product must be checked after delivery',
+                    'item_quantity' => $itemQuantity,
+                    'item_weight' => 0.5,
+                    'amount_to_collect' => round((float) $order->amount, 2),
+                    'item_description' => 'Parcel order #'.$order->invoice_id,
+                ]);
+
+                $responseData = $response->json();
+
+                if ($response->successful() && isset($responseData['data']['consignment_id'])) {
+                    $courierStatusId = OrderStatus::whereIn('slug', ['in-courier', 'shipped', 'on-the-way'])->value('id') ?? OrderStatusEnum::Shipped->value;
+                    $order->order_status = $courierStatusId;
+                    $order->consignment_id = $responseData['data']['consignment_id'];
+                    $order->save();
+                    $successCount++;
+                } else {
+                    $failedCount++;
+                    $lastErrorMessage = $responseData['message'] ?? 'Pathao booking rejected';
+                }
+            } catch (\Throwable $e) {
+                $failedCount++;
+                $lastErrorMessage = $e->getMessage();
+            }
+        }
+
+        $status = $successCount > 0 ? 'success' : 'failed';
+        $message = $successCount > 0
+            ? "Successfully dispatched {$successCount} order(s) to Pathao.".($failedCount > 0 ? " ({$failedCount} failed: {$lastErrorMessage})" : '')
+            : 'Failed to dispatch orders to Pathao: '.($lastErrorMessage ?: 'Unknown error');
+
+        if ($successCount > 0) {
+            Toastr::success($message, 'Pathao Courier');
+        } else {
+            Toastr::error($message, 'Pathao Courier');
+        }
+
+        return response()->json([
+            'status' => $status,
+            'message' => $message,
+            'success_count' => $successCount,
+            'failed_count' => $failedCount,
+        ]);
+    }
+
+    public function invoice($invoice_id)
+    {
+        $order = Order::where(['invoice_id' => $invoice_id])
+            ->with(['orderdetails.featuredImageRelation', 'orderdetails.image', 'payment', 'shipping', 'customer', 'status'])
+            ->firstOrFail();
+
+        $generalsetting = GeneralSetting::where('status', 1)->first();
+        $contact = Contact::where('status', 1)->first();
+        $invoice = InvoiceViewModel::fromOrder($order, $generalsetting, $contact);
+
+        return view('backEnd.order.invoice', compact('order', 'invoice'));
+    }
+
+    public function process($invoice_id)
+    {
+        $data = Order::where(['invoice_id' => $invoice_id])->with(['orderdetails', 'shipping', 'customer'])->firstOrFail();
+        $shippingcharge = ShippingCharge::where('status', 1)->get();
+
+        return view('backEnd.order.process', compact('data', 'shippingcharge'));
+    }
+
+    public function order_process(Request $request)
+    {
+        $order = Order::findOrFail($request->id);
+        $statusObj = OrderStatus::find($request->status);
+        $link = $statusObj ? $statusObj->slug : 'all';
+        $courier = (int) $order->order_status;
+        $isDispatched = $order->isCourierDispatched();
+
+        if (! $isDispatched) {
+            $order->order_status = $request->status;
+        }
+
+        $order->admin_note = $request->admin_note;
+        if ($request->has('note')) {
+            $order->note = $request->note;
+        }
+        $order->save();
+
+        $shipping_update = Shipping::where('order_id', $order->id)->first();
+        $shippingfee = ShippingCharge::find($request->area);
+        if ($shippingfee) {
+            if ($order->shipping_charge != $shippingfee->amount) {
+                $total = ($order->amount - $order->shipping_charge) + $shippingfee->amount;
+                $order->shipping_charge = $shippingfee->amount;
+                $order->amount = max(0, $total);
+                $order->save();
+            }
+            if ($shipping_update) {
+                $shipping_update->area = $shippingfee->name;
+            }
+        }
+
+        if ($shipping_update) {
+            $shipping_update->name = $request->name;
+            $shipping_update->phone = $request->phone;
+            $shipping_update->address = $request->address;
+            $shipping_update->save();
+        }
+
+        if (! $isDispatched && $courier !== (int) $request->status) {
+            $this->syncStockAndPaymentOnStatusChange($order, $courier, (int) $request->status);
+        }
+
+        $message = $isDispatched
+            ? 'Order details updated. Status remained locked by courier.'
+            : 'Order status change successfully';
+        Toastr::success('Success', $message);
+
+        return redirect('admin/order/'.$link);
+    }
+
+    public function destroy(Request $request)
+    {
+        $order = Order::where('id', $request->id)->delete();
+        $order_details = OrderDetails::where('order_id', $request->id)->delete();
+        $shipping = Shipping::where('order_id', $request->id)->delete();
+        $payment = Payment::where('order_id', $request->id)->delete();
+        Toastr::success('Success', 'Order delete success successfully');
+
+        return redirect()->back();
+    }
+
+    public function order_assign(Request $request)
+    {
+        $order_ids = $request->input('order_ids', []);
+        if (empty($order_ids)) {
+            return response()->json(['status' => 'error', 'message' => 'Please select at least one order.'], 422);
+        }
+        Order::whereIn('id', $order_ids)->update(['user_id' => $request->user_id]);
+
+        return response()->json(['status' => 'success', 'message' => 'Orders assigned to user successfully']);
+    }
+
+    public function order_status(Request $request)
+    {
+        $order_ids = $request->input('order_ids', []);
+        if (empty($order_ids)) {
+            return response()->json(['status' => 'error', 'message' => 'Please select at least one order.'], 422);
+        }
+
+        $newStatus = (int) $request->order_status;
+        $orders = Order::whereIn('id', $order_ids)->get();
+
+        $updatedCount = 0;
+        $skippedCount = 0;
+
+        foreach ($orders as $order) {
+            if ($order->isCourierDispatched()) {
+                $skippedCount++;
+
+                continue;
+            }
+
+            $oldStatus = (int) $order->order_status;
+            $order->order_status = $newStatus;
+            $order->save();
+            $this->syncStockAndPaymentOnStatusChange($order, $oldStatus, $newStatus);
+            $updatedCount++;
+        }
+
+        if ($updatedCount === 0 && $skippedCount > 0) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'Selected order(s) are dispatched to courier and cannot be changed manually.',
+            ], 422);
+        }
+
+        $message = "Order status changed for {$updatedCount} order(s).";
+        if ($skippedCount > 0) {
+            $message .= " ({$skippedCount} courier-managed order(s) skipped)";
+        }
+
+        return response()->json(['status' => 'success', 'message' => $message]);
+    }
+
+    public function bulk_destroy(Request $request)
+    {
+        $orders_id = $request->input('order_ids', []);
+        if (empty($orders_id)) {
+            return response()->json(['status' => 'error', 'message' => 'Please select at least one order.'], 422);
+        }
+        foreach ($orders_id as $order_id) {
+            Order::where('id', $order_id)->delete();
+            OrderDetails::where('order_id', $order_id)->delete();
+            Shipping::where('order_id', $order_id)->delete();
+            Payment::where('order_id', $order_id)->delete();
+        }
+
+        return response()->json(['status' => 'success', 'message' => 'Orders deleted successfully']);
+    }
+
+    public function order_print(Request $request)
+    {
+        $orders = Order::whereIn('id', $request->input('order_ids'))->with('orderdetails', 'payment', 'shipping', 'customer')->get();
+        $view = view('backEnd.order.print', ['orders' => $orders])->render();
+
+        return response()->json(['status' => 'success', 'view' => $view]);
+    }
+
+    public function bulk_courier($slug, Request $request)
+    {
+        $courier_info = Courierapi::where(['status' => 1, 'type' => $slug])->first();
+        if (! $courier_info) {
+            return response()->json(['status' => 'failed', 'message' => 'Courier API configuration not found or inactive'], 404);
+        }
+
+        $orders_id = (array) $request->input('order_ids', []);
+        if (empty($orders_id)) {
+            return response()->json(['status' => 'failed', 'message' => 'No orders selected'], 422);
+        }
+
+        $successCount = 0;
+        $failedCount = 0;
+        $steadfastService = ($slug === 'steadfast') ? app(SteadfastCourierService::class) : null;
+        $client = ($slug !== 'steadfast') ? new Client : null;
+
+        foreach ($orders_id as $order_id) {
+            $order = Order::with('shipping')->find($order_id);
+            if (! $order || (int) $order->order_status === (int) OrderStatusEnum::Delivered->value) {
+                continue;
+            }
+
+            $recipientName = $order->shipping ? $order->shipping->name : 'Customer';
+            $recipientPhone = $order->shipping ? $order->shipping->phone : '01700000000';
+            $recipientAddress = $order->shipping ? $order->shipping->address : 'Dhaka';
+            $orderNote = ! empty($order->note) ? $order->note : (! empty($order->admin_note) ? $order->admin_note : '');
+
+            $consignmentData = [
+                'invoice' => $order->invoice_id,
+                'recipient_name' => $recipientName,
+                'recipient_phone' => $recipientPhone,
+                'recipient_address' => $recipientAddress,
+                'cod_amount' => (float) $order->amount,
+                'note' => $orderNote,
+            ];
+
+            try {
+                if ($slug === 'steadfast' && $steadfastService) {
+                    $responseData = $steadfastService->placeOrder($consignmentData);
+                } else {
+                    $response = $client->post(rtrim($courier_info->url, '/').'/create_order', [
+                        'json' => $consignmentData,
+                        'headers' => [
+                            'Api-Key' => $courier_info->api_key,
+                            'Secret-Key' => $courier_info->secret_key,
+                            'Accept' => 'application/json',
+                        ],
+                        'timeout' => 15,
+                    ]);
+                    $responseData = json_decode($response->getBody(), true);
+                }
+
+                if (isset($responseData['status']) && (int) $responseData['status'] === 200) {
+                    $courierStatusId = OrderStatus::whereIn('slug', ['in-courier', 'shipped', 'on-the-way'])->value('id') ?? OrderStatusEnum::Shipped->value;
+                    $order->order_status = $courierStatusId;
+                    $order->courier_name = 'steadfast';
+                    $order->courier_status = 'pending';
+                    if (isset($responseData['consignment']['consignment_id'])) {
+                        $order->consignment_id = (string) $responseData['consignment']['consignment_id'];
+                    }
+                    if (isset($responseData['consignment']['tracking_code'])) {
+                        $order->tracking_code = (string) $responseData['consignment']['tracking_code'];
+                    } elseif (isset($responseData['consignment']['consignment_id']) && empty($order->tracking_code)) {
+                        $order->tracking_code = (string) $responseData['consignment']['consignment_id'];
+                    }
+                    $order->save();
+                    $successCount++;
+                } else {
+                    $failedCount++;
+                }
+            } catch (\Exception $e) {
+                $failedCount++;
+            }
+        }
+
+        $status = $successCount > 0 ? 'success' : 'failed';
+        $message = $successCount > 0
+            ? "Successfully dispatched {$successCount} order(s) to {$slug}.".($failedCount > 0 ? " ({$failedCount} failed)" : '')
+            : "Failed to dispatch orders to {$slug}.";
+
+        return response()->json([
+            'status' => $status,
+            'message' => $message,
+            'success_count' => $successCount,
+            'failed_count' => $failedCount,
+        ]);
+    }
+
+    public function check_courier_status($order_id, SyncCourierOrderStatusAction $syncAction)
+    {
+        $order = Order::findOrFail($order_id);
+        $result = $syncAction->execute($order);
+
+        if (! $result['success']) {
+            return response()->json([
+                'status' => 'failed',
+                'message' => $result['message'] ?? 'Failed to check courier status.',
+            ], 400);
+        }
+
+        return response()->json([
+            'status' => 'success',
+            'delivery_status' => $result['courier_status'],
+            'order_status' => $result['order_status'],
+            'status_changed' => $result['status_changed'],
+            'tracking_code' => $order->tracking_code ?? $order->consignment_id,
+            'message' => $result['message'],
+            'raw' => $result['raw'] ?? null,
+        ]);
+    }
+
+    public function refresh_fraud_score($order_id, Request $request, FraudCheckService $fraudService)
+    {
+        $order = Order::with(['shipping', 'customer'])->findOrFail($order_id);
+        $phone = $order->shipping?->phone ?? $order->customer?->phone ?? null;
+
+        if (empty($phone)) {
+            return response()->json([
+                'status' => 'error',
+                'message' => 'No phone number found for this order.',
+            ], 422);
+        }
+
+        $force = filter_var($request->input('force', true), FILTER_VALIDATE_BOOLEAN);
+        $result = $fraudService->check($phone, $force);
+
+        if ($result['status'] === 'success' && isset($result['total_stats']['delivery_rate'])) {
+            $stats = $result['total_stats'];
+            $rate = (float) $stats['delivery_rate'];
+            $order->f_check = $rate;
+            $order->fraud_report = [
+                'total_parcel' => (int) ($stats['total_parcel'] ?? 0),
+                'total_delivered' => (int) ($stats['total_delivered'] ?? 0),
+                'total_cancel' => (int) ($stats['total_cancel'] ?? 0),
+                'delivery_rate' => $rate,
+                'courier_breakdown' => $result['courier_breakdown'] ?? [],
+                'summaries' => $result['individual_response']['Summaries'] ?? [],
+            ];
+            $order->save();
+
+            $badgeClass = (int) $rate >= 80 ? 'bg-success' : ((int) $rate >= 50 ? 'bg-warning' : 'bg-danger');
+
+            return response()->json([
+                'status' => 'success',
+                'delivery_rate' => $rate,
+                'formatted_rate' => (int) round($rate) . '%',
+                'badge_class' => $badgeClass,
+                'stats' => $result['total_stats'],
+                'courier_breakdown' => $result['courier_breakdown'] ?? [],
+                'total_orders' => (int) ($result['total_stats']['total_parcel'] ?? 0),
+                'total_delivered' => (int) ($result['total_stats']['total_delivered'] ?? 0),
+                'total_cancel' => (int) ($result['total_stats']['total_cancel'] ?? 0),
+                'message' => "Updated Delivery Success: {$rate}% ({$result['total_stats']['total_delivered']} delivered / {$result['total_stats']['total_parcel']} parcels)",
+            ]);
+        }
+
+        return response()->json([
+            'status' => 'error',
+            'message' => $result['error'] ?? 'Could not fetch courier delivery stats from API.',
+        ], 400);
+    }
+
+    public function bulk_courier_sync(Request $request, SyncCourierOrderStatusAction $syncAction)
+    {
+        $orderIds = $request->input('order_ids', []);
+        if (empty($orderIds)) {
+            return response()->json(['status' => 'failed', 'message' => 'Please select at least one order to sync.'], 400);
+        }
+
+        $orders = Order::whereIn('id', $orderIds)
+            ->where(function ($q) {
+                $q->whereNotNull('consignment_id')->where('consignment_id', '!=', '')
+                    ->orWhereNotNull('tracking_code')->where('tracking_code', '!=', '');
+            })
+            ->get();
+
+        if ($orders->isEmpty()) {
+            return response()->json([
+                'status' => 'failed',
+                'message' => 'None of the selected orders have courier tracking details.',
+            ], 400);
+        }
+
+        $successCount = 0;
+        $statusChangedCount = 0;
+        $failedCount = 0;
+
+        foreach ($orders as $order) {
+            try {
+                $res = $syncAction->execute($order);
+                if ($res['success']) {
+                    $successCount++;
+                    if (! empty($res['status_changed'])) {
+                        $statusChangedCount++;
+                    }
+                } else {
+                    $failedCount++;
+                }
+            } catch (\Throwable $e) {
+                $failedCount++;
+            }
+        }
+
+        $message = "Synced {$successCount} order(s) with SteadFast.";
+        if ($statusChangedCount > 0) {
+            $message .= " {$statusChangedCount} status(es) updated.";
+        }
+        if ($failedCount > 0) {
+            $message .= " ({$failedCount} failed).";
+        }
+
+        return response()->json([
+            'status' => $successCount > 0 ? 'success' : 'failed',
+            'message' => $message,
+            'success_count' => $successCount,
+            'changed_count' => $statusChangedCount,
+            'failed_count' => $failedCount,
+        ]);
+    }
+
+    public function send_single_to_steadfast($order_id, SteadfastCourierService $steadfastService)
+    {
+        $order = Order::with('shipping')->findOrFail($order_id);
+
+        if (! $steadfastService->isConfigured()) {
+            if (request()->ajax() || request()->wantsJson()) {
+                return response()->json(['status' => 'failed', 'message' => 'SteadFast Courier API is not configured or inactive.'], 400);
+            }
+            Toastr::error('SteadFast Courier API is not configured or inactive.', 'Error');
+
+            return redirect()->back();
+        }
+
+        $recipientName = $order->shipping ? $order->shipping->name : 'Customer';
+        $recipientPhone = $order->shipping ? $order->shipping->phone : '01700000000';
+        $recipientAddress = $order->shipping ? $order->shipping->address : 'Dhaka';
+        $note = ! empty($order->note) ? $order->note : (! empty($order->admin_note) ? $order->admin_note : '');
+
+        $consignmentData = [
+            'invoice' => $order->invoice_id,
+            'recipient_name' => $recipientName,
+            'recipient_phone' => $recipientPhone,
+            'recipient_address' => $recipientAddress,
+            'cod_amount' => (float) $order->amount,
+            'note' => $note,
+        ];
+
+        $responseData = $steadfastService->placeOrder($consignmentData);
+
+        if (isset($responseData['status']) && (int) $responseData['status'] === 200) {
+            $courierStatusId = OrderStatus::whereIn('slug', ['in-courier', 'shipped', 'on-the-way'])->value('id') ?? OrderStatusEnum::Shipped->value;
+            $order->order_status = $courierStatusId;
+            $order->courier_name = 'steadfast';
+            $order->courier_status = 'pending';
+            if (isset($responseData['consignment']['consignment_id'])) {
+                $order->consignment_id = (string) $responseData['consignment']['consignment_id'];
+            }
+            if (isset($responseData['consignment']['tracking_code'])) {
+                $order->tracking_code = (string) $responseData['consignment']['tracking_code'];
+            } elseif (isset($responseData['consignment']['consignment_id']) && empty($order->tracking_code)) {
+                $order->tracking_code = (string) $responseData['consignment']['consignment_id'];
+            }
+            $order->save();
+
+            $msg = 'Order dispatched to SteadFast successfully! Tracking: '.($order->tracking_code ?? $order->consignment_id);
+            if (request()->ajax() || request()->wantsJson()) {
+                return response()->json(['status' => 'success', 'message' => $msg, 'order' => $order]);
+            }
+            Toastr::success($msg, 'Success');
+
+            return redirect()->back();
+        }
+
+        $errMsg = $responseData['message'] ?? 'Failed to send order to SteadFast Courier.';
+        if (request()->ajax() || request()->wantsJson()) {
+            return response()->json(['status' => 'failed', 'message' => $errMsg], 400);
+        }
+        Toastr::error($errMsg, 'Failed');
+
+        return redirect()->back();
+    }
+
+    public function stock_report(Request $request)
+    {
+        $query = Product::where('status', 1);
+
+        if ($request->filled('keyword')) {
+            $keyword = trim($request->keyword);
+            $query->where(function ($q) use ($keyword) {
+                $q->where('name', 'LIKE', '%'.$keyword.'%')
+                    ->orWhere('product_code', 'LIKE', '%'.$keyword.'%');
+            });
+        }
+
+        if ($request->filled('category_id')) {
+            $query->where('category_id', $request->category_id);
+        }
+
+        if ($request->filled('start_date') && $request->filled('end_date')) {
+            $query->whereBetween('updated_at', [$request->start_date.' 00:00:00', $request->end_date.' 23:59:59']);
+        }
+
+        $total_products = (clone $query)->count();
+        $total_stock = (clone $query)->sum('stock') ?? 0;
+        $total_purchase = (clone $query)->sum(DB::raw('purchase_price * stock')) ?? 0;
+        $total_price = (clone $query)->sum(DB::raw('new_price * stock')) ?? 0;
+
+        $products = $query->with('category:id,name')
+            ->select('id', 'name', 'product_code', 'purchase_price', 'new_price', 'stock', 'category_id', 'updated_at')
+            ->orderBy('id', 'DESC')
+            ->paginate(15);
+
+        $categories = Category::where('status', 1)->orderBy('name', 'ASC')->select('id', 'name')->get();
+
+        return view('backEnd.reports.stock', compact(
+            'products',
+            'categories',
+            'total_products',
+            'total_stock',
+            'total_purchase',
+            'total_price'
+        ));
+    }
+
+    public function order_report(Request $request)
+    {
+        $users = User::where('status', 1)->get();
+        $order_statuses = OrderStatus::where('status', 1)->orderBy('id', 'asc')->get();
+
+        $query = OrderDetails::with(['shipping', 'order.user', 'order.status']);
+
+        if ($request->filled('keyword')) {
+            $keyword = trim($request->keyword);
+            $query->where(function ($q) use ($keyword) {
+                $q->where('product_name', 'LIKE', '%'.$keyword.'%')
+                    ->orWhereHas('order', function ($sub) use ($keyword) {
+                        $sub->where('invoice_id', 'LIKE', '%'.$keyword.'%');
+                    })
+                    ->orWhereHas('shipping', function ($sub) use ($keyword) {
+                        $sub->where('name', 'LIKE', '%'.$keyword.'%')
+                            ->orWhere('phone', 'LIKE', '%'.$keyword.'%');
+                    });
+            });
+        }
+
+        if ($request->filled('order_status')) {
+            $query->whereHas('order', function ($sub) use ($request) {
+                $sub->where('order_status', $request->order_status);
+            });
+        }
+
+        if ($request->filled('user_id')) {
+            $query->whereHas('order', function ($sub) use ($request) {
+                $sub->where('user_id', $request->user_id);
+            });
+        }
+
+        if ($request->filled('start_date') && $request->filled('end_date')) {
+            $startDate = Carbon::parse($request->start_date)->startOfDay();
+            $endDate = Carbon::parse($request->end_date)->endOfDay();
+            $query->whereBetween('created_at', [$startDate, $endDate]);
+        } elseif ($request->filled('start_date')) {
+            $query->where('created_at', '>=', Carbon::parse($request->start_date)->startOfDay());
+        } elseif ($request->filled('end_date')) {
+            $query->where('created_at', '<=', Carbon::parse($request->end_date)->endOfDay());
+        }
+
+        $total_orders_count = (clone $query)->distinct('order_id')->count('order_id');
+        $total_purchase = (clone $query)->sum(DB::raw('purchase_price * qty')) ?? 0;
+        $total_item = (clone $query)->sum('qty') ?? 0;
+        $total_sales = (clone $query)->sum(DB::raw('sale_price * qty')) ?? 0;
+        $total_profit = $total_sales - $total_purchase;
+
+        $orders = $query->latest('id')->paginate(15)->appends($request->query());
+
+        return view('backEnd.reports.order', compact(
+            'orders',
+            'users',
+            'order_statuses',
+            'total_orders_count',
+            'total_purchase',
+            'total_item',
+            'total_sales',
+            'total_profit'
+        ));
+    }
+
+    public function order_create()
+    {
+        $products = Product::select('id', 'name', 'new_price', 'product_code')->where(['status' => 1])->get();
+        $cartinfo = CartService::instance('pos_shopping')->content();
+        $cartProductIds = $cartinfo->pluck('id')->unique();
+        $cartProducts = Product::whereIn('id', $cartProductIds)->with(['sizes', 'colors'])->get()->keyBy('id');
+        $shippingcharge = ShippingCharge::where('status', 1)->get();
+
+        return view('backEnd.order.create', compact('products', 'cartinfo', 'cartProducts', 'shippingcharge'));
+    }
+
+    public function product_search(Request $request)
+    {
+        $q = trim($request->get('q', $request->get('keyword', '')));
+        if (empty($q)) {
+            return response()->json(['products' => []]);
+        }
+
+        $products = Product::where('status', 1)
+            ->where(function ($query) use ($q) {
+                $query->where('name', 'LIKE', "%{$q}%")
+                    ->orWhere('product_code', $q)
+                    ->orWhere('product_code', 'LIKE', "%{$q}%")
+                    ->orWhere('pro_barcode', $q)
+                    ->orWhere('pro_barcode', 'LIKE', "%{$q}%")
+                    ->orWhere('id', $q);
+            })
+            ->with('image')
+            ->limit(20)
+            ->get()
+            ->map(function ($p) {
+                return [
+                    'id' => $p->id,
+                    'name' => $p->name,
+                    'new_price' => (float) $p->new_price,
+                    'stock' => (int) ($p->stock ?? 0),
+                    'product_code' => $p->product_code ?? '',
+                    'image' => $p->image ? asset($p->image->image) : '',
+                ];
+            });
+
+        $exactMatch = $products->first(function ($p) use ($q) {
+            return strtolower($p['product_code']) === strtolower($q) || (string) $p['id'] === $q;
+        });
+
+        return response()->json([
+            'products' => $products,
+            'exact_match' => $exactMatch ? true : false,
+            'matched_product' => $exactMatch,
+        ]);
+    }
+
+    public function order_store(AdminOrderStoreRequest $request)
+    {
+        if (CartService::instance('pos_shopping')->count() <= 0) {
+            Toastr::error('Your shopping empty', 'Failed!');
+
+            return redirect()->back();
+        }
+
+        $order = DB::transaction(function () use ($request) {
+            $subtotal = CartService::instance('pos_shopping')->subtotal();
+            $subtotal = (float) str_replace([',', '.00'], '', $subtotal);
+            $discount = (float) (Session::get('pos_discount', 0) + Session::get('product_discount', 0));
+            $shippingfee = ShippingCharge::find($request->area);
+            $shippingAmount = $shippingfee ? (float) $shippingfee->amount : 0;
+            $areaName = $shippingfee ? $shippingfee->name : 'Inside Dhaka';
+
+            $customer = Customer::where('phone', $request->phone)->first();
+            if (! $customer) {
+                $autoPassword = (string) rand(111111, 999999);
+                $customer = new Customer;
+                $customer->name = $request->name;
+                $customer->slug = Str::slug($request->name).'-'.rand(100, 999);
+                $customer->phone = $request->phone;
+                $customer->password = bcrypt($autoPassword);
+                $customer->verify = 1;
+                $customer->status = 1;
+                $customer->save();
+                SmsGateway::sendAutoGeneratedPasswordSms($customer, $autoPassword);
+            }
+
+            // 1. Order record
+            $order = new Order;
+            $order->invoice_id = rand(11111, 99999);
+            $order->amount = max(0, ($subtotal + $shippingAmount) - $discount);
+            $order->discount = $discount;
+            $order->shipping_charge = $shippingAmount;
+            $order->customer_id = $customer->id;
+            $order->order_status = OrderStatusEnum::Pending->value;
+            $order->note = $request->note;
+            $order->save();
+
+            // 2. Shipping record
+            $shipping = new Shipping;
+            $shipping->order_id = $order->id;
+            $shipping->customer_id = $customer->id;
+            $shipping->name = $request->name;
+            $shipping->phone = $request->phone;
+            $shipping->address = $request->address;
+            $shipping->area = $areaName;
+            $shipping->save();
+
+            // 3. Payment record
+            $payment = new Payment;
+            $payment->order_id = $order->id;
+            $payment->customer_id = $customer->id;
+            $payment->payment_method = 'Cash On Delivery';
+            $payment->amount = $order->amount;
+            $payment->payment_status = PaymentStatusEnum::Pending->value;
+            $payment->save();
+
+            // 4. Order details records & stock reduction
+            foreach (CartService::instance('pos_shopping')->content() as $cart) {
+                $orderDetails = new OrderDetails;
+                $orderDetails->order_id = $order->id;
+                $orderDetails->product_id = $cart->id;
+                $orderDetails->product_name = $cart->name;
+                $orderDetails->purchase_price = $cart->options->purchase_price ?? 0;
+                $orderDetails->product_discount = $cart->options->product_discount ?? 0;
+                $orderDetails->product_size = $cart->options->product_size ?? null;
+                $orderDetails->product_color = $cart->options->product_color ?? null;
+                $orderDetails->sale_price = $cart->price;
+                $orderDetails->qty = $cart->qty;
+                $orderDetails->save();
+
+                // Atomically decrement stock
+                Product::where('id', $cart->id)->decrement('stock', $cart->qty);
+            }
+
+            return $order;
+        });
+
+        CartService::instance('pos_shopping')->destroy();
+        Session::forget('pos_shipping');
+        Session::forget('pos_discount');
+        Session::forget('product_discount');
+
+        event(new OrderPlaced($order));
+
+        Toastr::success('Thanks, Your order placed successfully', 'Success!');
+
+        return redirect('admin/order/pending');
+    }
+
+    public function product_attributes(Request $request)
+    {
+        $product = Product::with(['sizes', 'colors', 'image'])->find($request->id);
+        if (! $product) {
+            return response()->json(['error' => 'Product not found'], 404);
+        }
+
+        $sizes = $product->sizes->map(function ($s) {
+            return [
+                'id' => $s->id,
+                'name' => $s->sizeName,
+            ];
+        });
+
+        $colors = $product->colors->map(function ($c) {
+            return [
+                'id' => $c->id,
+                'name' => $c->colorName,
+                'color' => $c->color ?? '',
+            ];
+        });
+
+        $hasAttributes = $sizes->isNotEmpty() || $colors->isNotEmpty();
+
+        return response()->json([
+            'id' => $product->id,
+            'name' => $product->name,
+            'new_price' => (float) $product->new_price,
+            'old_price' => (float) $product->old_price,
+            'stock' => (int) ($product->stock ?? 0),
+            'image' => $product->image ? asset($product->image->image) : '',
+            'has_attributes' => $hasAttributes,
+            'sizes' => $sizes,
+            'colors' => $colors,
+        ]);
+    }
+
+    public function cart_add(Request $request)
+    {
+        $product = Product::select('id', 'name', 'stock', 'new_price', 'old_price', 'purchase_price', 'slug')->where(['id' => $request->id])->first();
+        if (! $product) {
+            return response()->json(['error' => 'Product not found'], 404);
+        }
+        $qty = (int) ($request->qty ?: 1);
+        $cartinfo = CartService::instance('pos_shopping')->add([
+            'id' => $product->id,
+            'name' => $product->name,
+            'qty' => $qty > 0 ? $qty : 1,
+            'price' => $product->new_price,
+            'options' => [
+                'slug' => $product->slug,
+                'image' => $product->image ? $product->image->image : '',
+                'old_price' => $product->old_price,
+                'purchase_price' => $product->purchase_price,
+                'product_discount' => 0,
+                'product_size' => $request->product_size ?: null,
+                'product_color' => $request->product_color ?: null,
+            ],
+        ]);
+
+        return response()->json(compact('cartinfo'));
+    }
+
+    public function cart_update_attribute(Request $request)
+    {
+        $targetId = $request->rowId ?? $request->id;
+        $cart = CartService::instance('pos_shopping')->content()->where('rowId', $targetId)->first();
+        if (! $cart) {
+            return response()->json(['error' => 'Cart item not found'], 404);
+        }
+
+        $options = (array) $cart->options;
+        if ($request->has('product_size')) {
+            $options['product_size'] = $request->product_size ?: null;
+        }
+        if ($request->has('product_color')) {
+            $options['product_color'] = $request->product_color ?: null;
+        }
+        if ($request->has('image')) {
+            $options['image'] = $request->image ?: null;
+        }
+
+        $cartinfo = CartService::instance('pos_shopping')->update($cart->rowId, [
+            'options' => $options,
+        ]);
+
+        return response()->json(['status' => 'success', 'cartinfo' => $cartinfo]);
+    }
+
+    public function cart_content()
+    {
+        $cartinfo = CartService::instance('pos_shopping')->content();
+        $productIds = $cartinfo->pluck('id')->unique();
+        $cartProducts = Product::whereIn('id', $productIds)->with(['sizes', 'colors', 'image', 'images'])->get()->keyBy('id');
+
+        return view('backEnd.order.cart_content', compact('cartinfo', 'cartProducts'));
+    }
+
+    public function cart_details()
+    {
+        $cartinfo = CartService::instance('pos_shopping')->content();
+        $discount = 0;
+        foreach ($cartinfo as $cart) {
+            $discount += $cart->options->product_discount * $cart->qty;
+        }
+        Session::put('product_discount', $discount);
+
+        return view('backEnd.order.cart_details', compact('cartinfo'));
+    }
+
+    public function cart_increment(Request $request)
+    {
+        $qty = $request->qty + 1;
+        $cartinfo = CartService::instance('pos_shopping')->update($request->id, $qty);
+
+        return response()->json($cartinfo);
+    }
+
+    public function cart_decrement(Request $request)
+    {
+        $qty = $request->qty - 1;
+        $cartinfo = CartService::instance('pos_shopping')->update($request->id, $qty);
+
+        return response()->json($cartinfo);
+    }
+
+    public function cart_remove(Request $request)
+    {
+        $remove = CartService::instance('pos_shopping')->remove($request->id);
+        $cartinfo = CartService::instance('pos_shopping')->content();
+
+        return response()->json($cartinfo);
+    }
+
+    public function product_discount(Request $request)
+    {
+        $discount = (float) $request->discount;
+        $cart = CartService::instance('pos_shopping')->content()->where('rowId', $request->id)->first();
+        if ($cart) {
+            $options = (array) $cart->options;
+            $options['product_discount'] = $discount;
+            $cartinfo = CartService::instance('pos_shopping')->update($request->id, [
+                'options' => $options,
+            ]);
+
+            return response()->json($cartinfo);
+        }
+
+        return response()->json(['error' => 'Cart item not found'], 404);
+    }
+
+    public function cart_shipping(Request $request)
+    {
+        $shipping = 0;
+        if ($request->filled('id')) {
+            $shippingCharge = ShippingCharge::where(['status' => 1, 'id' => $request->id])->first();
+            $shipping = $shippingCharge ? (float) $shippingCharge->amount : 0;
+        }
+        Session::put('pos_shipping', $shipping);
+
+        return response()->json($shipping);
+    }
+
+    public function cart_clear(Request $request)
+    {
+        CartService::instance('pos_shopping')->destroy();
+        Session::forget('pos_shipping');
+        Session::forget('pos_discount');
+        Session::forget('product_discount');
+
+        return redirect()->back();
+    }
+
+    public function order_edit($invoice_id)
+    {
+        $products = Product::select('id', 'name', 'new_price', 'old_price', 'product_code', 'stock')
+            ->where('status', 1)
+            ->get();
+        $shippingcharge = ShippingCharge::where('status', 1)->get();
+        $order = Order::where('invoice_id', $invoice_id)
+            ->with(['shipping', 'payment', 'customer', 'status'])
+            ->firstOrFail();
+        $orderstatus = OrderStatus::where('status', 1)
+            ->whereNotIn('slug', Order::getCourierFilterSlugs())
+            ->get();
+
+        $this->populateCartFromOrder($order);
+
+        $cartinfo = CartService::instance('pos_shopping')->content();
+        $cartProductIds = $cartinfo->pluck('id')->unique();
+        $cartProducts = Product::whereIn('id', $cartProductIds)->with(['sizes', 'colors', 'image', 'images'])->get()->keyBy('id');
+        $shippinginfo = $order->shipping;
+
+        // Customer intelligence
+        $customerPhone = $shippinginfo?->phone ?? $order->customer?->phone ?? '';
+        $customerStats = [
+            'total_orders' => 0,
+            'completed_orders' => 0,
+            'cancelled_orders' => 0,
+        ];
+        if (! empty($customerPhone)) {
+            $customerOrders = Order::whereHas('shipping', function ($q) use ($customerPhone) {
+                $q->where('phone', $customerPhone);
+            })->orWhereHas('customer', function ($q) use ($customerPhone) {
+                $q->where('phone', $customerPhone);
+            })->get();
+
+            $deliveredStatusIds = OrderStatus::whereIn('slug', ['completed', 'delivered'])->pluck('id')->toArray();
+            $cancelledStatusIds = OrderStatus::where('slug', 'cancelled')->pluck('id')->toArray();
+
+            $customerStats['total_orders'] = $customerOrders->count();
+            $customerStats['completed_orders'] = $customerOrders->whereIn('order_status', $deliveredStatusIds)->count();
+            $customerStats['cancelled_orders'] = $customerOrders->whereIn('order_status', $cancelledStatusIds)->count();
+        }
+
+        // Customer Courier Fraud Check Intelligence (Instant cached read; background AJAX handles non-blocking live sync)
+        $fraudCheckData = null;
+        if (! empty($customerPhone)) {
+            $fraudCheckData = app(FraudCheckService::class)->getCached($customerPhone);
+        }
+
+        return view('backEnd.order.edit', compact(
+            'products',
+            'cartinfo',
+            'cartProducts',
+            'shippingcharge',
+            'shippinginfo',
+            'order',
+            'orderstatus',
+            'customerStats',
+            'fraudCheckData'
+        ));
+    }
+
+    public function order_edit_reset($invoice_id)
+    {
+        $order = Order::where('invoice_id', $invoice_id)->firstOrFail();
+        $this->populateCartFromOrder($order);
+        Toastr::success('Cart reset to original order items', 'Success');
+
+        return redirect()->route('admin.order.edit', $invoice_id);
+    }
+
+    private function populateCartFromOrder(Order $order): void
+    {
+        CartService::instance('pos_shopping')->destroy();
+        Session::put('product_discount', (float) $order->discount);
+        Session::put('pos_shipping', (float) $order->shipping_charge);
+        Session::forget('pos_discount');
+
+        $orderdetails = OrderDetails::where('order_id', $order->id)->with('image')->get();
+        foreach ($orderdetails as $ordetails) {
+            CartService::instance('pos_shopping')->add([
+                'id' => $ordetails->product_id,
+                'name' => $ordetails->product_name,
+                'qty' => $ordetails->qty,
+                'price' => $ordetails->sale_price,
+                'options' => [
+                    'image' => $ordetails->product_image ?: ($ordetails->image ? $ordetails->image->image : ''),
+                    'purchase_price' => $ordetails->purchase_price ?? 0,
+                    'product_discount' => $ordetails->product_discount ?? 0,
+                    'details_id' => $ordetails->id,
+                    'product_size' => $ordetails->product_size,
+                    'product_color' => $ordetails->product_color,
+                ],
+            ]);
+        }
+    }
+
+    public function order_update(AdminOrderUpdateRequest $request)
+    {
+        if (CartService::instance('pos_shopping')->count() <= 0) {
+            Toastr::error('Your shopping cart is empty', 'Failed!');
+
+            return redirect()->back();
+        }
+
+        $order = Order::where('id', $request->order_id)->firstOrFail();
+        $oldStatus = (int) $order->order_status;
+        $newStatus = $oldStatus;
+
+        try {
+            DB::transaction(function () use ($request, $order, $oldStatus, &$newStatus) {
+                $subtotalRaw = CartService::instance('pos_shopping')->subtotal();
+                $subtotal = (float) str_replace(',', '', $subtotalRaw);
+                $itemDiscount = (float) (Session::get('pos_discount', 0) + Session::get('product_discount', 0));
+                $orderDiscount = $request->filled('order_discount') ? (float) $request->order_discount : 0;
+                $totalDiscount = $itemDiscount + $orderDiscount;
+                $advanceAmount = $request->filled('advance_amount') ? (float) $request->advance_amount : 0;
+
+                $shippingfee = ShippingCharge::find($request->area);
+                if (! $shippingfee) {
+                    $shippingfee = ShippingCharge::where('status', 1)->first();
+                }
+                $customShipping = $request->filled('custom_shipping') ? (float) $request->custom_shipping : null;
+                $shippingAmount = $customShipping !== null ? $customShipping : ($shippingfee ? (float) $shippingfee->amount : (float) $order->shipping_charge);
+                $shippingAreaName = $shippingfee ? $shippingfee->name : ($order->shipping?->area ?? 'Standard Delivery');
+
+                // Find or create customer with normalized phone
+                $cleanPhone = Phone::normalize($request->phone);
+                $exits_customer = Customer::where('phone', $cleanPhone)->orWhere('phone', $request->phone)->select('phone', 'id')->first();
+                if ($exits_customer) {
+                    $customer_id = $exits_customer->id;
+                } else {
+                    $autoPassword = (string) rand(111111, 999999);
+                    $store = new Customer;
+                    $store->name = $request->name;
+                    $store->slug = Str::slug($request->name).'-'.rand(100, 999);
+                    $store->phone = $cleanPhone ?: $request->phone;
+                    $store->password = bcrypt($autoPassword);
+                    $store->verify = 1;
+                    $store->status = 1;
+                    $store->save();
+                    $customer_id = $store->id;
+                    SmsGateway::sendAutoGeneratedPasswordSms($store, $autoPassword);
+                }
+
+                // Order data save
+                if (empty($order->invoice_id)) {
+                    $order->invoice_id = rand(11111, 99999);
+                }
+                $netPayable = max(0, ($subtotal + $shippingAmount) - $totalDiscount - $advanceAmount);
+                $order->amount = $netPayable;
+                $order->discount = $totalDiscount > 0 ? $totalDiscount : 0;
+                $order->shipping_charge = $shippingAmount;
+                $order->customer_id = $customer_id;
+
+                // Only allow status update if not courier-locked and not a courier status
+                if ($request->filled('order_status')) {
+                    $requestedStatus = (int) $request->order_status;
+                    $courierStatusIds = OrderStatus::whereIn('slug', Order::getCourierFilterSlugs())->pluck('id')->toArray();
+                    if (! in_array($requestedStatus, $courierStatusIds, true)) {
+                        if (! $order->isCourierLocked() || $requestedStatus === $oldStatus) {
+                            $order->order_status = $requestedStatus;
+                            $newStatus = $requestedStatus;
+                        }
+                    }
+                }
+
+                if ($request->has('admin_note')) {
+                    $order->admin_note = $request->admin_note;
+                }
+                if ($request->has('note')) {
+                    $order->note = $request->note;
+                }
+                $order->save();
+
+                // Shipping data save (null-safe)
+                $shipping = Shipping::firstOrNew(['order_id' => $order->id]);
+                $shipping->customer_id = $customer_id;
+                $shipping->name = $request->name;
+                $shipping->phone = $cleanPhone ?: $request->phone;
+                $shipping->address = $request->address;
+                $shipping->area = $shippingAreaName;
+                $shipping->save();
+
+                // Payment data save (null-safe)
+                $payment = Payment::firstOrNew(['order_id' => $order->id]);
+                $payment->customer_id = $customer_id;
+                $payment->payment_method = $request->filled('payment_method') ? $request->payment_method : ($payment->payment_method ?: 'Cash On Delivery');
+                $payment->payment_status = $request->filled('payment_status') ? $request->payment_status : ($payment->payment_status ?: PaymentStatusEnum::Pending->value);
+                if ($request->filled('trx_id')) {
+                    $payment->trx_id = $request->trx_id;
+                }
+                if ($request->filled('sender_number')) {
+                    $payment->sender_number = $request->sender_number;
+                }
+                $payment->amount = $advanceAmount > 0 ? $advanceAmount : $order->amount;
+                $payment->save();
+
+                $order->payment_status = $payment->payment_status;
+                $order->save();
+
+                // Order details data save (safely handling new, modified and removed items)
+                static $hasProductImageCol = null;
+                if ($hasProductImageCol === null) {
+                    $hasProductImageCol = Schema::hasColumn('order_details', 'product_image');
+                }
+
+                $retainedDetailIds = [];
+                foreach (CartService::instance('pos_shopping')->content() as $cart) {
+                    $detailsId = $cart->options->details_id ?? null;
+                    $orderDetail = $detailsId ? OrderDetails::where('id', $detailsId)->where('order_id', $order->id)->first() : null;
+                    if (! $orderDetail) {
+                        $orderDetail = new OrderDetails;
+                        $orderDetail->order_id = $order->id;
+                        $orderDetail->product_id = $cart->id;
+                        $orderDetail->product_name = $cart->name;
+                    }
+                    $orderDetail->purchase_price = $cart->options->purchase_price ?? 0;
+                    $orderDetail->product_discount = $cart->options->product_discount ?? 0;
+                    $orderDetail->product_size = $cart->options->product_size ?? null;
+                    $orderDetail->product_color = $cart->options->product_color ?? null;
+                    if ($hasProductImageCol) {
+                        $orderDetail->product_image = $cart->options->image ?? null;
+                    }
+                    $orderDetail->sale_price = $cart->price;
+                    $orderDetail->qty = $cart->qty;
+                    $orderDetail->save();
+
+                    $retainedDetailIds[] = $orderDetail->id;
+                }
+
+                // Clean up any removed order details
+                if (! empty($retainedDetailIds)) {
+                    OrderDetails::where('order_id', $order->id)->whereNotIn('id', $retainedDetailIds)->delete();
+                }
+
+                // Sync stock and payment if status changed
+                if ($oldStatus !== $newStatus) {
+                    $this->syncStockAndPaymentOnStatusChange($order, $oldStatus, $newStatus);
+                }
+            });
+
+            CartService::instance('pos_shopping')->destroy();
+            Session::forget('pos_shipping');
+            Session::forget('pos_discount');
+            Session::forget('product_discount');
+
+            Toastr::success('Order updated successfully', 'Success!');
+
+            $statusSlug = $order->fresh()->status ? $order->fresh()->status->slug : 'all';
+
+            return redirect()->route('admin.orders', $statusSlug);
+        } catch (\Throwable $e) {
+            Log::error('Order update failed: '.$e->getMessage(), [
+                'order_id' => $request->order_id,
+                'file' => $e->getFile(),
+                'line' => $e->getLine(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            Toastr::error('Failed to update order: '.$e->getMessage(), 'Error!');
+
+            return redirect()->back()->withInput();
+        }
+    }
+}

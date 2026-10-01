@@ -1,0 +1,53 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Shipping extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'order_id',
+        'customer_id',
+        'name',
+        'phone',
+        'address',
+        'area',
+        'district',
+        'thana',
+        'pathao_city_id',
+        'pathao_zone_id',
+        'pathao_area_id',
+    ];
+
+    protected static function booted()
+    {
+        static::saving(function ($shipping) {
+            if (empty($shipping->district) || $shipping->isDirty('address')) {
+                $geo = app(\App\Services\GeoOrderAnalyticsService::class)->resolveFromAddress(
+                    $shipping->address,
+                    $shipping->area
+                );
+                if (!empty($geo['district']) && empty($shipping->district)) {
+                    $shipping->district = $geo['district'];
+                }
+                if (!empty($geo['thana']) && empty($shipping->thana)) {
+                    $shipping->thana = $geo['thana'];
+                }
+            }
+        });
+    }
+
+    public function shippingCharge()
+    {
+        return $this->belongsTo(ShippingCharge::class, 'area');
+    }
+
+    public function shipping_charge()
+    {
+        return $this->belongsTo(ShippingCharge::class, 'area');
+    }
+}

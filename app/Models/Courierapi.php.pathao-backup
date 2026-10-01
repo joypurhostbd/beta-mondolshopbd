@@ -1,0 +1,24 @@
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Courierapi extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'type',
+        'api_key',
+        'secret_key',
+        'url',
+        'token',
+        'status',
+    ];
+
+    protected $casts = [
+        'status' => 'integer',
+    ];
+}

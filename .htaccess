@@ -1,0 +1,29 @@
+<IfModule mod_rewrite.c>
+
+    RewriteEngine On
+
+    # Authorization Header
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Existing real files/directories
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Frontend assets
+    RewriteRule ^frontEnd/(.*)$ public/frontEnd/$1 [L]
+
+    # Backend assets
+    RewriteRule ^backEnd/(.*)$ public/backEnd/$1 [L]
+
+    # Uploaded files
+    RewriteRule ^uploads/(.*)$ public/uploads/$1 [L]
+
+    # Laravel public files
+    RewriteRule ^storage/(.*)$ public/storage/$1 [L]
+
+    # Laravel application
+    RewriteRule ^(.*)$ public/$1 [L]
+
+</IfModule>
